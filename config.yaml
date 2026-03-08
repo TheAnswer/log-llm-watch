@@ -1,0 +1,39 @@
+server:
+  host: 0.0.0.0
+  port: 8088
+
+storage:
+  db_path: /opt/dozzle-llm-watch/events.sqlite3
+
+ollama:
+  url: http://localhost:11434
+  model: qwen3.5:9b
+  timeout_seconds: 180
+
+analysis:
+  batch_window_minutes: 1
+  max_examples_per_group: 5
+  min_events_before_analysis: 1
+  ignore_if_older_than_hours: 24
+
+daily_report:
+  enabled: true
+  hour: 9
+  minute: 0
+  lookback_hours: 24
+
+notify:
+  method: ntfy
+  ntfy_url: http://localhost:2586/nas_log_alerts
+  title: "NAS log alert"
+
+filters:
+  ignore_message_regex:
+    - '(?i)deprecated'
+    - '(?i)healthcheck'
+    - '(?i)ping'
+    - '(?i)client disconnected'
+    - '(?i)broken pipe'
+    - '(?i)favicon'
+    - '(?i)metrics'
+    - '(?i)broadcast failed'

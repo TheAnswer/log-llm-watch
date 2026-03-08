@@ -8,7 +8,7 @@ storage:
 ollama:
   url: http://localhost:11434
   model: qwen3.5:9b
-  timeout_seconds: 180
+  timeout_seconds: 300
 
 analysis:
   batch_window_minutes: 1

@@ -519,40 +519,93 @@ def build_daily_report_prompt(groups: list[dict[str, Any]], lookback_hours: int)
     }
 
     return f"""
-You are generating a daily homelab operations report from Docker alert events.
+You are a homelab SRE generating a daily operations digest from container alert events.
 
-Write a concise plain-text report in exactly this format:
+Your job:
+- identify the most important operational issues
+- separate real problems from repetitive noise
+- keep the report concise
+- prioritize service-impacting problems
+
+Output rules:
+- Output plain text only
+- Do not output JSON
+- Do not output markdown code fences
+- Do not use conversational language
+- Do not ask questions
+- Do not offer help
+- Do not address the reader directly
+- Maximum length: 1200 characters
+- If there are no serious problems, say so clearly
+
+Write the report in exactly this structure:
 
 Overall Status: Healthy|Warning|Critical
 
 Summary:
-<2-4 short sentences>
+<2-4 short sentences summarizing the day>
 
 Critical Issues:
-- <bullet>
-- <bullet>
+- <container>: <issue> — <brief impact/action>
+- <container>: <issue> — <brief impact/action>
 
 Warnings:
-- <bullet>
-- <bullet>
+- <container>: <issue> — <brief impact/action>
+- <container>: <issue> — <brief impact/action>
 
 Noise / Likely Harmless:
-- <bullet>
-- <bullet>
+- <container>: <short description>
+- <container>: <short description>
 
-Rules:
-- Do NOT ask questions
-- Do NOT offer help
-- Do NOT address the reader directly
-- Do NOT use markdown headings with ### or **
-- Do NOT use code fences
-- If a section has no items, omit that section
-- Keep bullets short and operational
-- Focus on actionable issues only
+Classification guidance:
+- Critical = service crashes, database failures, repeated connection failures, disk/full filesystem issues, OOM, panic/fatal/segfault, persistent upstream failures
+- Warning = transient errors, rate limits, lock contention, repeated retries, degraded features, missing cache directories
+- Noise / Likely Harmless = one-off warnings, routine transfer stats, benign retries, expected disconnects, repetitive low-value log spam
+
+Selection rules:
+- Prefer recurring and service-impacting issues
+- Collapse repeated similar events into one bullet
+- Omit empty sections
+- Ignore stack trace details unless they change the diagnosis
+- Do not mention every event; summarize patterns
 
 Input:
 {json.dumps(payload, ensure_ascii=False, indent=2)}
 """.strip()
+
+def clean_daily_report_text(text: str) -> str:
+    text = text.strip()
+
+    # Remove common chatbot endings
+    text = re.sub(
+        r"\n*(Would you like.*|Let me know.*|If you want.*|I can help.*)$",
+        "",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    ).strip()
+
+    # Remove markdown emphasis if the model sneaks it in
+    text = text.replace("**", "").replace("### ", "")
+
+    # Ensure status line exists
+    if not text.startswith("Overall Status:"):
+        text = "Overall Status: Warning\n\n" + text
+
+    return text
+
+def truncate_for_ntfy(text: str, max_chars: int = 3500) -> str:
+    """
+    ntfy rejects very large messages with HTTP 400.
+    This safely truncates messages to a reasonable size.
+    """
+    text = text.strip()
+
+    if len(text) <= max_chars:
+        return text
+
+    truncated = text[:max_chars].rstrip()
+
+    return truncated + "\n\n[message truncated]"
 
 def send_daily_report() -> None:
     cfg = CONFIG["daily_report"]
@@ -599,8 +652,11 @@ def send_daily_report() -> None:
             "Daily report generation failed. Review container logs manually."
         )
 
+    report_body = clean_daily_report_text(report_body)
+
     # Build final message
     message = f"Homelab Daily Health Report\n\n{report_body}"
+    message = truncate_for_ntfy(message, max_chars=3500)
 
     # Determine ntfy priority
     priority = "default"

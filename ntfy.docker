@@ -1,0 +1,9 @@
+docker run -d \
+  --name ntfy \
+  --restart unless-stopped \
+  -p 2586:80 \
+  --health-cmd="wget -qO- http://localhost/v1/health || exit 1" \
+  --health-interval=30s \
+  -v ntfy-cache:/var/cache/ntfy \
+  -v ntfy-config:/etc/ntfy \
+  binwiederhier/ntfy serve

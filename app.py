@@ -102,29 +102,77 @@ def find_first(d: Any, keys: list[str], default=None):
 
 
 def extract_event(payload: Any) -> dict[str, str]:
-    # Intentionally flexible; adjust once you capture a real Dozzle webhook sample.
-    container = find_first(payload, ["container", "container_name", "name", "service"], "unknown")
-    host = find_first(payload, ["host", "hostname", "node"], "")
-    stream = find_first(payload, ["stream"], "")
-    level = find_first(payload, ["level", "severity"], "")
-    message = find_first(payload, ["message", "msg", "log", "text"], "")
+    source = "dozzle-webhook"
+    host = ""
+    container = "unknown"
+    stream = ""
+    level = ""
+    message = ""
 
-    if isinstance(message, dict):
-        message = json.dumps(message, ensure_ascii=False)
+    if not isinstance(payload, dict):
+        return {
+            "source": source,
+            "host": host,
+            "container": container,
+            "stream": stream,
+            "level": level,
+            "message": json.dumps(payload, ensure_ascii=False),
+        }
 
-    if not isinstance(message, str) or not message.strip():
+    # Dozzle formatted webhook payload
+    # Example:
+    # {
+    #   "text": "prowlarr",
+    #   "blocks": [
+    #     {"type":"section","text":{"type":"mrkdwn","text":"*prowlarr*\nactual log..."}},
+    #     {"type":"context","elements":[{"type":"mrkdwn","text":"Host: unraid | Image: linuxserver/prowlarr:latest"}]}
+    #   ]
+    # }
+
+    container = str(payload.get("text") or "unknown").strip() or "unknown"
+
+    blocks = payload.get("blocks", [])
+    if isinstance(blocks, list):
+        # Main message block
+        if len(blocks) > 0 and isinstance(blocks[0], dict):
+            text_obj = blocks[0].get("text", {})
+            if isinstance(text_obj, dict):
+                message = str(text_obj.get("text") or "").strip()
+
+        # Context block: Host / Image
+        if len(blocks) > 1 and isinstance(blocks[1], dict):
+            elements = blocks[1].get("elements", [])
+            if isinstance(elements, list) and elements:
+                first_el = elements[0]
+                if isinstance(first_el, dict):
+                    context_text = str(first_el.get("text") or "")
+                    # Example: "Host: unraid | Image: linuxserver/prowlarr:latest"
+                    m = re.search(r"Host:\s*([^|]+)", context_text)
+                    if m:
+                        host = m.group(1).strip()
+
+    if not message:
         message = json.dumps(payload, ensure_ascii=False)
 
-    source = "dozzle-webhook"
+    # Strip the leading "*container*\n" if present
+    prefix_pattern = rf"^\*?{re.escape(container)}\*?\s*\n"
+    message = re.sub(prefix_pattern, "", message, count=1, flags=re.IGNORECASE).strip()
+
+    # Infer rough level from message contents
+    lowered = message.lower()
+    if any(x in lowered for x in ["panic", "fatal", "segfault", "out of memory", "no space left"]):
+        level = "critical"
+    elif any(x in lowered for x in ["error", "exception", "traceback", "badrequest", "warn", "warning"]):
+        level = "error"
+
     return {
         "source": source,
-        "host": str(host or ""),
-        "container": str(container or "unknown"),
-        "stream": str(stream or ""),
-        "level": str(level or ""),
-        "message": str(message).strip(),
+        "host": host,
+        "container": container,
+        "stream": stream,
+        "level": level,
+        "message": message,
     }
-
 
 def should_ignore(message: str) -> bool:
     for pattern in CONFIG["filters"]["ignore_message_regex"]:

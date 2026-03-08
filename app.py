@@ -27,7 +27,7 @@ def load_config() -> dict[str, Any]:
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
-
+now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S %Z")
 CONFIG = load_config()
 DB_PATH = CONFIG["storage"]["db_path"]
 
@@ -58,6 +58,12 @@ def init_db() -> None:
         CREATE TABLE IF NOT EXISTS daily_runs (
             run_date TEXT PRIMARY KEY,
             created_at TEXT NOT NULL
+        )
+        """)
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS weekly_runs (
+        run_key TEXT PRIMARY KEY,
+        created_at TEXT NOT NULL
         )
         """)
         conn.commit()
@@ -441,6 +447,11 @@ def analysis_loop() -> None:
         except Exception as e:
             print(f"[analysis_loop] daily report error: {e}", flush=True)
 
+        try:
+            maybe_send_weekly_report()
+        except Exception as e:
+            print(f"[analysis_loop] weekly report error: {e}", flush=True)
+
         time.sleep(interval)
 
 def today_local_date_str() -> str:
@@ -520,6 +531,10 @@ def build_daily_report_prompt(groups: list[dict[str, Any]], lookback_hours: int)
 
     return f"""
 You are a homelab SRE generating a daily operations digest from container alert events.
+
+Current system date/time: {now_str}
+Assume this date is correct.
+Do not question or validate the system clock unless the input explicitly shows clock drift evidence.
 
 Your job:
 - identify the most important operational issues
@@ -718,6 +733,226 @@ def maybe_send_daily_report() -> None:
 def daily_report_now():
     try:
         send_daily_report()
+        return {"ok": True}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
+
+def weekly_run_key(now: datetime) -> str:
+    year, week, _ = now.isocalendar()
+    return f"{year}-W{week:02d}"
+
+
+def weekly_report_already_sent(run_key: str) -> bool:
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT 1 FROM weekly_runs WHERE run_key = ?",
+            (run_key,),
+        ).fetchone()
+    return row is not None
+
+
+def mark_weekly_report_sent(run_key: str) -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO weekly_runs (run_key, created_at) VALUES (?, ?)",
+            (run_key, utcnow().isoformat()),
+        )
+        conn.commit()
+
+
+def fetch_events_for_days(days: int) -> list[sqlite3.Row]:
+    cutoff = utcnow() - timedelta(days=days)
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM events
+            WHERE created_at >= ?
+            ORDER BY created_at ASC
+            """,
+            (cutoff.isoformat(),),
+        ).fetchall()
+    return rows
+
+
+def group_events_for_weekly(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
+    grouped = defaultdict(lambda: {
+        "count": 0,
+        "container": "",
+        "host": "",
+        "level": "",
+        "stream": "",
+        "first_seen": None,
+        "last_seen": None,
+        "examples": [],
+        "fingerprint": "",
+        "days_seen": set(),
+    })
+
+    max_examples = CONFIG["analysis"]["max_examples_per_group"]
+
+    for row in rows:
+        key = row["fingerprint"]
+        g = grouped[key]
+        g["count"] += 1
+        g["container"] = row["container"]
+        g["host"] = row["host"]
+        g["level"] = row["level"]
+        g["stream"] = row["stream"]
+        g["fingerprint"] = row["fingerprint"]
+
+        created_at = row["created_at"]
+        day = str(created_at)[:10]
+        g["days_seen"].add(day)
+
+        if g["first_seen"] is None:
+            g["first_seen"] = created_at
+        g["last_seen"] = created_at
+
+        if len(g["examples"]) < max_examples:
+            g["examples"].append(row["message"])
+
+    output = []
+    for g in grouped.values():
+        out = dict(g)
+        out["days_seen"] = sorted(out["days_seen"])
+        out["days_seen_count"] = len(out["days_seen"])
+        output.append(out)
+
+    return sorted(
+        output,
+        key=lambda x: (x["days_seen_count"], x["count"]),
+        reverse=True,
+    )
+
+
+def build_weekly_report_prompt(groups: list[dict[str, Any]], lookback_days: int) -> str:
+    payload = {
+        "lookback_days": lookback_days,
+        "groups": groups[:30],
+    }
+
+    return f"""
+You are generating a weekly homelab reliability report from Docker alert events.
+
+Current system date/time: {now_str}
+Assume this date is correct.
+Do not question or validate the system clock unless the input explicitly shows clock drift evidence.
+
+Output plain text only in exactly this structure:
+
+Overall Status: Healthy|Warning|Critical
+
+Summary:
+<2-4 short sentences>
+
+Top Recurring Issues:
+- <container>: <issue> — <count/trend/impact>
+- <container>: <issue> — <count/trend/impact>
+
+Top Noisy Containers:
+- <container>: <short description>
+- <container>: <short description>
+
+Recommended Actions:
+- <short operational action>
+- <short operational action>
+- <short operational action>
+
+Rules:
+- Do not ask questions
+- Do not offer help
+- Do not address the reader directly
+- Do not use markdown headings like ### or **
+- Maximum length: 1600 characters
+- Prioritize recurring and service-impacting issues
+- Collapse repeated similar events into one bullet
+- Mention harmless noise only if it is very frequent
+- Prefer issues seen on multiple days over one-off bursts
+
+Input:
+{json.dumps(payload, ensure_ascii=False, indent=2)}
+""".strip()
+
+
+def send_weekly_report() -> None:
+    cfg = CONFIG["weekly_report"]
+    lookback_days = cfg.get("lookback_days", 7)
+
+    rows = fetch_events_for_days(lookback_days)
+    print(f"[weekly_report] fetched {len(rows)} rows from last {lookback_days}d", flush=True)
+
+    if not rows:
+        message = (
+            "Homelab Weekly Reliability Report\n\n"
+            "Overall Status: Healthy\n\n"
+            "No alert-level container events were recorded in the last 7 days."
+        )
+        send_ntfy(message, priority="default")
+        print("[weekly_report] sent empty healthy report", flush=True)
+        return
+
+    groups = group_events_for_weekly(rows)
+
+    # Keep the prompt compact and trend-focused
+    groups = groups[:20]
+
+    prompt = build_weekly_report_prompt(groups, lookback_days)
+
+    try:
+        report_body = call_ollama_text(prompt).strip()
+        report_body = clean_daily_report_text(report_body)
+
+        if not report_body.startswith("Overall Status:"):
+            report_body = "Overall Status: Warning\n\n" + report_body
+
+    except Exception as e:
+        print(f"[weekly_report] LLM failure: {e}", flush=True)
+        report_body = (
+            "Overall Status: Warning\n\n"
+            "Weekly reliability report generation failed. Review logs manually."
+        )
+
+    message = f"Homelab Weekly Reliability Report\n\n{report_body}"
+    message = truncate_for_ntfy(message, max_chars=3500)
+
+    priority = "urgent" if "Overall Status: Critical" in message else "default"
+    send_ntfy(message, priority=priority)
+
+    print("[weekly_report] sent weekly report", flush=True)
+
+
+def maybe_send_weekly_report() -> None:
+    cfg = CONFIG.get("weekly_report", {})
+    if not cfg.get("enabled", False):
+        return
+
+    now = datetime.now()
+    run_key = weekly_run_key(now)
+
+    if weekly_report_already_sent(run_key):
+        return
+
+    target_weekday = int(cfg.get("weekday", 0))  # 0=Monday
+    target_hour = int(cfg.get("hour", 9))
+    target_minute = int(cfg.get("minute", 0))
+
+    if (
+        now.weekday() == target_weekday and
+        (
+            now.hour > target_hour or
+            (now.hour == target_hour and now.minute >= target_minute)
+        )
+    ):
+        send_weekly_report()
+        mark_weekly_report_sent(run_key)
+
+
+@app.post("/weekly-report-now")
+def weekly_report_now():
+    try:
+        send_weekly_report()
         return {"ok": True}
     except Exception as e:
         return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})

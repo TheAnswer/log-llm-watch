@@ -353,7 +353,7 @@ def call_ollama(prompt: str) -> dict[str, Any]:
     r.raise_for_status()
     data = r.json()
 
-    print(f"[call_ollama] full response json: {data!r}", flush=True)
+    #print(f"[call_ollama] full response json: {data!r}", flush=True)
 
     raw_response = (data.get("response") or "").strip()
     raw_thinking = (data.get("thinking") or "").strip()
@@ -514,105 +514,115 @@ def group_events_for_daily(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
 
 def build_daily_report_prompt(groups: list[dict[str, Any]], lookback_hours: int) -> str:
     payload = {
-        "instruction": (
-            "You are summarizing the last 24 hours of homelab Docker alert events. "
-            "Provide an operational summary for the owner. "
-            "Be concise, accurate, and do not invent issues."
-        ),
         "lookback_hours": lookback_hours,
         "groups": groups,
     }
 
     return f"""
-Analyze these grouped homelab Docker alert events from the last {lookback_hours} hours.
+You are summarizing homelab Docker alert events from the last {lookback_hours} hours.
 
-Return ONLY valid JSON with this schema:
+Write a concise plain-text daily health report.
 
-{{
-  "overall_status": "healthy|warning|critical",
-  "critical_issues": [
-    {{
-      "container": "string",
-      "title": "string",
-      "summary": "string",
-      "action": "string"
-    }}
-  ],
-  "warnings": [
-    {{
-      "container": "string",
-      "title": "string",
-      "summary": "string"
-    }}
-  ],
-  "noise": [
-    {{
-      "container": "string",
-      "title": "string"
-    }}
-  ],
-  "operator_summary": "string"
-}}
+Requirements:
+- Start with exactly one line: Overall Status: Healthy, Overall Status: Warning, or Overall Status: Critical
+- Then add a short summary paragraph
+- Then add sections only if relevant:
+  Critical Issues
+  Warnings
+  Noise / Likely Harmless
+- Use short bullet points
+- Do not output JSON
+- Do not output markdown code fences
+- Be concise and operationally useful
 
 Input:
 {json.dumps(payload, ensure_ascii=False, indent=2)}
 """.strip()
 
-
 def send_daily_report() -> None:
     cfg = CONFIG["daily_report"]
-    lookback_hours = cfg["lookback_hours"]
+    lookback_hours = cfg.get("lookback_hours", 24)
 
+    # Fetch recent events
     rows = fetch_events_for_lookback(lookback_hours)
-    print(f"[daily_report] fetched {len(rows)} rows from last {lookback_hours}h", flush=True)
 
+    print(
+        f"[daily_report] fetched {len(rows)} rows from last {lookback_hours}h",
+        flush=True,
+    )
+
+    # If nothing happened, send healthy report
     if not rows:
-        message = "Homelab Daily Health Report\n\nNo matching alert events were recorded in the last 24 hours.\n\nOverall Status: Healthy"
+        message = (
+            "Homelab Daily Health Report\n\n"
+            "Overall Status: Healthy\n\n"
+            "No alert-level container events were recorded in the last 24 hours."
+        )
+
         send_ntfy(message, priority="default")
-        print("[daily_report] sent empty healthy report", flush=True)
+
+        print("[daily_report] sent healthy empty report", flush=True)
         return
 
+    # Group events for the LLM
     groups = group_events_for_daily(rows)
+
+    # Build prompt
     prompt = build_daily_report_prompt(groups, lookback_hours)
-    result = call_ollama(prompt)
 
-    critical_issues = result.get("critical_issues", [])
-    warnings = result.get("warnings", [])
-    noise = result.get("noise", [])
-    overall_status = result.get("overall_status", "warning")
-    operator_summary = result.get("operator_summary", "Daily homelab summary generated.")
+    try:
+        report_body = call_ollama_text(prompt).strip()
 
-    lines = ["Homelab Daily Health Report", ""]
-    lines.append(f"Overall Status: {overall_status.capitalize()}")
-    lines.append("")
-    lines.append(operator_summary)
-    lines.append("")
+        if not report_body:
+            raise ValueError("LLM returned empty report")
 
-    if critical_issues:
-        lines.append("Critical Issues")
-        for item in critical_issues[:10]:
-            lines.append(f"- {item['container']}: {item['title']}")
-            lines.append(f"  {item['summary']}")
-            lines.append(f"  Action: {item['action']}")
-        lines.append("")
+    except Exception as e:
+        print(f"[daily_report] LLM failure: {e}", flush=True)
 
-    if warnings:
-        lines.append("Warnings")
-        for item in warnings[:10]:
-            lines.append(f"- {item['container']}: {item['title']}")
-            lines.append(f"  {item['summary']}")
-        lines.append("")
+        report_body = (
+            "Overall Status: Warning\n\n"
+            "Daily report generation failed. Review container logs manually."
+        )
 
-    if noise:
-        lines.append("Noise / Likely Harmless")
-        for item in noise[:10]:
-            lines.append(f"- {item['container']}: {item['title']}")
-        lines.append("")
+    # Build final message
+    message = f"Homelab Daily Health Report\n\n{report_body}"
 
-    priority = "urgent" if overall_status == "critical" else "default"
-    send_ntfy("\n".join(lines).strip(), priority=priority)
+    # Determine ntfy priority
+    priority = "default"
+
+    if "Overall Status: Critical" in message:
+        priority = "urgent"
+    elif "Overall Status: Warning" in message:
+        priority = "high"
+
+    send_ntfy(message, priority=priority)
+
     print("[daily_report] sent daily report", flush=True)
 
+
+def call_ollama_text(prompt: str) -> str:
+    url = CONFIG["ollama"]["url"].rstrip("/") + "/api/generate"
+    body = {
+        "model": CONFIG["ollama"]["model"],
+        "prompt": prompt,
+        "stream": False,
+        "options": {
+            "temperature": 0.2,
+        },
+    }
+
+    r = requests.post(url, json=body, timeout=CONFIG["ollama"]["timeout_seconds"])
+    r.raise_for_status()
+    data = r.json()
+
+    raw_response = (data.get("response") or "").strip()
+    raw_thinking = (data.get("thinking") or "").strip()
+
+    text = raw_response or raw_thinking
+    if not text:
+        raise ValueError(f"Ollama returned empty response and empty thinking. Full payload: {data!r}")
+
+    return text
 
 def maybe_send_daily_report() -> None:
     cfg = CONFIG.get("daily_report", {})

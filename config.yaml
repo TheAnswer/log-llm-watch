@@ -29,6 +29,11 @@ weekly_report:
   minute: 0
   lookback_days: 7
 
+retention:
+  events_days: 14
+  daily_runs_days: 180
+  weekly_runs_days: 365
+
 notify:
   method: ntfy
   ntfy_url: http://localhost:2586/nas_log_alerts

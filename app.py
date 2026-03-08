@@ -66,6 +66,12 @@ def init_db() -> None:
         created_at TEXT NOT NULL
         )
         """)
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS housekeeping_runs (
+        run_key TEXT PRIMARY KEY,
+        created_at TEXT NOT NULL
+        )
+        """)
         conn.commit()
 
 
@@ -451,6 +457,11 @@ def analysis_loop() -> None:
             maybe_send_weekly_report()
         except Exception as e:
             print(f"[analysis_loop] weekly report error: {e}", flush=True)
+
+        try:
+            maybe_run_cleanup()
+        except Exception as e:
+            print(f"[analysis_loop] cleanup error: {e}", flush=True)
 
         time.sleep(interval)
 
@@ -953,6 +964,82 @@ def maybe_send_weekly_report() -> None:
 def weekly_report_now():
     try:
         send_weekly_report()
+        return {"ok": True}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
+
+def cleanup_old_data() -> None:
+    retention = CONFIG.get("retention", {})
+    events_days = int(retention.get("events_days", 30))
+    daily_runs_days = int(retention.get("daily_runs_days", 180))
+    weekly_runs_days = int(retention.get("weekly_runs_days", 365))
+
+    events_cutoff = (utcnow() - timedelta(days=events_days)).isoformat()
+    daily_cutoff = (utcnow() - timedelta(days=daily_runs_days)).isoformat()
+    weekly_cutoff = (utcnow() - timedelta(days=weekly_runs_days)).isoformat()
+
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.cursor()
+
+        cur.execute("DELETE FROM events WHERE created_at < ?", (events_cutoff,))
+        deleted_events = cur.rowcount
+
+        cur.execute("DELETE FROM daily_runs WHERE created_at < ?", (daily_cutoff,))
+        deleted_daily = cur.rowcount
+
+        cur.execute("DELETE FROM weekly_runs WHERE created_at < ?", (weekly_cutoff,))
+        deleted_weekly = cur.rowcount
+
+        conn.commit()
+
+    print(
+        f"[cleanup] deleted events={deleted_events} daily_runs={deleted_daily} weekly_runs={deleted_weekly}",
+        flush=True,
+    )
+
+def vacuum_db() -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("VACUUM")
+    print("[cleanup] vacuum completed", flush=True)
+
+def housekeeping_run_key(prefix: str, now: datetime) -> str:
+    return f"{prefix}-{now.strftime('%Y-%m-%d')}"
+
+
+def housekeeping_already_ran(run_key: str) -> bool:
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT 1 FROM housekeeping_runs WHERE run_key = ?",
+            (run_key,),
+        ).fetchone()
+    return row is not None
+
+
+def mark_housekeeping_ran(run_key: str) -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO housekeeping_runs (run_key, created_at) VALUES (?, ?)",
+            (run_key, utcnow().isoformat()),
+        )
+        conn.commit()
+
+
+def maybe_run_cleanup() -> None:
+    now = datetime.now()
+    run_key = housekeeping_run_key("cleanup", now)
+
+    if housekeeping_already_ran(run_key):
+        return
+
+    # run once daily after 03:00
+    if now.hour >= 3:
+        cleanup_old_data()
+        mark_housekeeping_ran(run_key)
+
+@app.post("/vacuum-now")
+def vacuum_now():
+    try:
+        vacuum_db()
         return {"ok": True}
     except Exception as e:
         return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})

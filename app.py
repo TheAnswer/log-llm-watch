@@ -392,8 +392,8 @@ def send_ntfy(message: str, priority: str = "default") -> None:
         "Tags": "warning,robot_face",
     }
     r = requests.post(url, data=message.encode("utf-8"), headers=headers, timeout=30)
-    r.raise_for_status()
-
+    if not r.ok:
+        raise RuntimeError(f"ntfy error {r.status_code}: {r.text}")
 
 def mark_processed(ids: list[int]) -> None:
     if not ids:
@@ -519,21 +519,36 @@ def build_daily_report_prompt(groups: list[dict[str, Any]], lookback_hours: int)
     }
 
     return f"""
-You are summarizing homelab Docker alert events from the last {lookback_hours} hours.
+You are generating a daily homelab operations report from Docker alert events.
 
-Write a concise plain-text daily health report.
+Write a concise plain-text report in exactly this format:
 
-Requirements:
-- Start with exactly one line: Overall Status: Healthy, Overall Status: Warning, or Overall Status: Critical
-- Then add a short summary paragraph
-- Then add sections only if relevant:
-  Critical Issues
-  Warnings
-  Noise / Likely Harmless
-- Use short bullet points
-- Do not output JSON
-- Do not output markdown code fences
-- Be concise and operationally useful
+Overall Status: Healthy|Warning|Critical
+
+Summary:
+<2-4 short sentences>
+
+Critical Issues:
+- <bullet>
+- <bullet>
+
+Warnings:
+- <bullet>
+- <bullet>
+
+Noise / Likely Harmless:
+- <bullet>
+- <bullet>
+
+Rules:
+- Do NOT ask questions
+- Do NOT offer help
+- Do NOT address the reader directly
+- Do NOT use markdown headings with ### or **
+- Do NOT use code fences
+- If a section has no items, omit that section
+- Keep bullets short and operational
+- Focus on actionable issues only
 
 Input:
 {json.dumps(payload, ensure_ascii=False, indent=2)}

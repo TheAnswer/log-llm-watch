@@ -1325,7 +1325,10 @@ async def syslog_webhook(request: Request):
     event = extract_syslog_event(payload)
 
     if should_ignore(event["message"]):
-        return JSONResponse({"stored": False, "reason": "ignored"})
+        return JSONResponse(
+            {"stored": False, "reason": "ignored"},
+            headers={"Connection": "close"},
+        )
 
     fp = store_event(payload, event)
 
@@ -1335,5 +1338,6 @@ async def syslog_webhook(request: Request):
             "source": event["source"],
             "container": event["container"],
             "fingerprint": fp,
-        }
+        },
+        headers={"Connection": "close"},
     )

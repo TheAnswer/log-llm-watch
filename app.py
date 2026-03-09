@@ -27,51 +27,63 @@ def load_config() -> dict[str, Any]:
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
-now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S %Z")
+
 CONFIG = load_config()
 DB_PATH = CONFIG["storage"]["db_path"]
 
-app = FastAPI(title="Dozzle LLM Watch")
+app = FastAPI(title="Homelab LLM Watch")
 
 
 def init_db() -> None:
     Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("""
-        CREATE TABLE IF NOT EXISTS events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            created_at TEXT NOT NULL,
-            processed INTEGER NOT NULL DEFAULT 0,
-            source TEXT,
-            host TEXT,
-            container TEXT,
-            stream TEXT,
-            level TEXT,
-            message TEXT NOT NULL,
-            raw_json TEXT NOT NULL,
-            fingerprint TEXT NOT NULL
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL,
+                processed INTEGER NOT NULL DEFAULT 0,
+                source TEXT,
+                host TEXT,
+                container TEXT,
+                stream TEXT,
+                level TEXT,
+                message TEXT NOT NULL,
+                raw_json TEXT NOT NULL,
+                fingerprint TEXT NOT NULL
+            )
+            """
         )
-        """)
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_events_processed_created ON events(processed, created_at)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_events_fingerprint ON events(fingerprint)")
-        conn.execute("""
-        CREATE TABLE IF NOT EXISTS daily_runs (
-            run_date TEXT PRIMARY KEY,
-            created_at TEXT NOT NULL
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_events_processed_created ON events(processed, created_at)"
         )
-        """)
-        conn.execute("""
-        CREATE TABLE IF NOT EXISTS weekly_runs (
-        run_key TEXT PRIMARY KEY,
-        created_at TEXT NOT NULL
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_events_fingerprint ON events(fingerprint)"
         )
-        """)
-        conn.execute("""
-        CREATE TABLE IF NOT EXISTS housekeeping_runs (
-        run_key TEXT PRIMARY KEY,
-        created_at TEXT NOT NULL
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS daily_runs (
+                run_date TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL
+            )
+            """
         )
-        """)
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS weekly_runs (
+                run_key TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS housekeeping_runs (
+                run_key TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
         conn.commit()
 
 
@@ -84,6 +96,10 @@ def db():
         conn.close()
 
 
+def current_system_time_str() -> str:
+    return datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+
+
 def normalize_message(msg: str) -> str:
     msg = re.sub(r"\b\d{4}-\d{2}-\d{2}[T ][0-9:\.\+\-Z]+\b", "<ts>", msg)
     msg = re.sub(r"\b[0-9a-f]{8,}\b", "<hex>", msg, flags=re.IGNORECASE)
@@ -92,28 +108,23 @@ def normalize_message(msg: str) -> str:
     return msg[:500]
 
 
-def fingerprint(container: str, message: str) -> str:
-    return f"{container}::{normalize_message(message)}"
+def fingerprint_for_event(event: dict[str, str]) -> str:
+    source = event.get("source", "")
+    host = event.get("host", "")
+    container = event.get("container", "")
+    stream = event.get("stream", "")
+    message = event.get("message", "")
+    return f"{source}::{host}::{container}::{stream}::{normalize_message(message)}"
 
 
-def find_first(d: Any, keys: list[str], default=None):
-    if isinstance(d, dict):
-        for k in keys:
-            if k in d and d[k] not in (None, ""):
-                return d[k]
-        for v in d.values():
-            found = find_first(v, keys, default=None)
-            if found not in (None, ""):
-                return found
-    elif isinstance(d, list):
-        for item in d:
-            found = find_first(item, keys, default=None)
-            if found not in (None, ""):
-                return found
-    return default
+def should_ignore(message: str) -> bool:
+    for pattern in CONFIG["filters"]["ignore_message_regex"]:
+        if re.search(pattern, message):
+            return True
+    return False
 
 
-def extract_event(payload: Any) -> dict[str, str]:
+def extract_dozzle_event(payload: Any) -> dict[str, str]:
     source = "dozzle-webhook"
     host = ""
     container = "unknown"
@@ -131,34 +142,21 @@ def extract_event(payload: Any) -> dict[str, str]:
             "message": json.dumps(payload, ensure_ascii=False),
         }
 
-    # Dozzle formatted webhook payload
-    # Example:
-    # {
-    #   "text": "prowlarr",
-    #   "blocks": [
-    #     {"type":"section","text":{"type":"mrkdwn","text":"*prowlarr*\nactual log..."}},
-    #     {"type":"context","elements":[{"type":"mrkdwn","text":"Host: unraid | Image: linuxserver/prowlarr:latest"}]}
-    #   ]
-    # }
-
     container = str(payload.get("text") or "unknown").strip() or "unknown"
 
     blocks = payload.get("blocks", [])
     if isinstance(blocks, list):
-        # Main message block
         if len(blocks) > 0 and isinstance(blocks[0], dict):
             text_obj = blocks[0].get("text", {})
             if isinstance(text_obj, dict):
                 message = str(text_obj.get("text") or "").strip()
 
-        # Context block: Host / Image
         if len(blocks) > 1 and isinstance(blocks[1], dict):
             elements = blocks[1].get("elements", [])
             if isinstance(elements, list) and elements:
                 first_el = elements[0]
                 if isinstance(first_el, dict):
                     context_text = str(first_el.get("text") or "")
-                    # Example: "Host: unraid | Image: linuxserver/prowlarr:latest"
                     m = re.search(r"Host:\s*([^|]+)", context_text)
                     if m:
                         host = m.group(1).strip()
@@ -166,11 +164,9 @@ def extract_event(payload: Any) -> dict[str, str]:
     if not message:
         message = json.dumps(payload, ensure_ascii=False)
 
-    # Strip the leading "*container*\n" if present
     prefix_pattern = rf"^\*?{re.escape(container)}\*?\s*\n"
     message = re.sub(prefix_pattern, "", message, count=1, flags=re.IGNORECASE).strip()
 
-    # Infer rough level from message contents
     lowered = message.lower()
     if any(x in lowered for x in ["panic", "fatal", "segfault", "out of memory", "no space left"]):
         level = "critical"
@@ -186,38 +182,135 @@ def extract_event(payload: Any) -> dict[str, str]:
         "message": message,
     }
 
-def should_ignore(message: str) -> bool:
-    for pattern in CONFIG["filters"]["ignore_message_regex"]:
-        if re.search(pattern, message):
-            return True
-    return False
 
+def normalize_windows_level(level: Any, level_name: str | None = None) -> str:
+    if level_name:
+        name = str(level_name).strip().lower()
+        if name in {"critical", "crit"}:
+            return "critical"
+        if name in {"error", "err"}:
+            return "error"
+        if name in {"warning", "warn"}:
+            return "warning"
+        if name in {"info", "information"}:
+            return "info"
 
-@app.on_event("startup")
-def startup_event():
-    init_db()
-    t = threading.Thread(target=analysis_loop, daemon=True)
-    t.start()
-
-
-@app.get("/healthz")
-def healthz():
-    return {"ok": True}
-
-
-@app.post("/dozzle")
-async def dozzle_webhook(request: Request):
     try:
-        payload = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Expected JSON body")
+        lvl = int(level)
+    except (TypeError, ValueError):
+        return ""
 
-    event = extract_event(payload)
+    if lvl == 1:
+        return "critical"
+    if lvl == 2:
+        return "error"
+    if lvl == 3:
+        return "warning"
+    if lvl == 4:
+        return "info"
+    return ""
 
-    if should_ignore(event["message"]):
-        return JSONResponse({"stored": False, "reason": "ignored"})
 
-    fp = fingerprint(event["container"], event["message"])
+def extract_windows_event(payload: Any) -> dict[str, str]:
+    source = "windows-event"
+    host = ""
+    container = "Windows"
+    stream = ""
+    level = ""
+    message = ""
+
+    if not isinstance(payload, dict):
+        return {
+            "source": source,
+            "host": host,
+            "container": container,
+            "stream": stream,
+            "level": level,
+            "message": json.dumps(payload, ensure_ascii=False),
+        }
+
+    host = str(
+        payload.get("Hostname")
+        or payload.get("Computer")
+        or payload.get("host")
+        or ""
+    ).strip().lower()
+
+    channel = str(
+        payload.get("Channel")
+        or payload.get("channel")
+        or payload.get("EventChannel")
+        or "Windows"
+    ).strip()
+
+    provider = str(
+        payload.get("ProviderName")
+        or payload.get("SourceName")
+        or payload.get("Provider")
+        or payload.get("provider")
+        or ""
+    ).strip()
+
+    rendered_message = (
+        payload.get("Message")
+        or payload.get("message")
+        or payload.get("EventData")
+        or payload.get("RenderedMessage")
+        or ""
+    )
+
+    if isinstance(rendered_message, (dict, list)):
+        message = json.dumps(rendered_message, ensure_ascii=False)
+    else:
+        message = str(rendered_message).strip()
+
+    event_id = payload.get("EventID") or payload.get("EventId") or payload.get("event_id")
+    level_name = payload.get("LevelName") or payload.get("level_name")
+
+    level = normalize_windows_level(
+        payload.get("SeverityValue")
+        or payload.get("LevelValue")
+        or payload.get("Level"),
+        level_name,
+    )
+
+    # Override for known Security semantics
+    try:
+        event_id_int = int(event_id)
+    except (TypeError, ValueError):
+        event_id_int = None
+
+    if channel.lower() == "security":
+        if event_id_int == 4625:
+            level = "warning"
+        elif event_id_int in {4624, 4634}:
+            level = "info"
+        elif event_id_int in {4697, 4688}:
+            level = level or "info"
+
+    if not message:
+        message = json.dumps(payload, ensure_ascii=False)
+
+    stream_parts = []
+    if provider:
+        stream_parts.append(provider)
+    if event_id not in (None, ""):
+        stream_parts.append(f"EventID={event_id}")
+    stream = " | ".join(stream_parts)
+
+    container = channel or "Windows"
+
+    return {
+        "source": source,
+        "host": host,
+        "container": container,
+        "stream": stream,
+        "level": level,
+        "message": message,
+    }
+
+def store_event(payload: Any, event: dict[str, str]) -> str:
+    fp = fingerprint_for_event(event)
 
     with db() as conn:
         conn.execute(
@@ -239,7 +332,65 @@ async def dozzle_webhook(request: Request):
         )
         conn.commit()
 
-    return JSONResponse({"stored": True, "container": event["container"], "fingerprint": fp})
+    return fp
+
+
+@app.on_event("startup")
+def startup_event():
+    init_db()
+    t = threading.Thread(target=analysis_loop, daemon=True)
+    t.start()
+
+
+@app.get("/healthz")
+def healthz():
+    return {"ok": True}
+
+
+@app.post("/dozzle")
+async def dozzle_webhook(request: Request):
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Expected JSON body")
+
+    event = extract_dozzle_event(payload)
+
+    if should_ignore(event["message"]):
+        return JSONResponse({"stored": False, "reason": "ignored"})
+
+    fp = store_event(payload, event)
+    return JSONResponse(
+        {
+            "stored": True,
+            "source": event["source"],
+            "container": event["container"],
+            "fingerprint": fp,
+        }
+    )
+
+
+@app.post("/windows")
+async def windows_webhook(request: Request):
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Expected JSON body")
+
+    event = extract_windows_event(payload)
+
+    if should_ignore(event["message"]):
+        return JSONResponse({"stored": False, "reason": "ignored"})
+
+    fp = store_event(payload, event)
+    return JSONResponse(
+        {
+            "stored": True,
+            "source": event["source"],
+            "container": event["container"],
+            "fingerprint": fp,
+        }
+    )
 
 
 def fetch_unprocessed_events() -> list[sqlite3.Row]:
@@ -259,17 +410,21 @@ def fetch_unprocessed_events() -> list[sqlite3.Row]:
 
 
 def group_events(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
-    grouped = defaultdict(lambda: {
-        "count": 0,
-        "container": "",
-        "level": "",
-        "stream": "",
-        "first_seen": None,
-        "last_seen": None,
-        "examples": [],
-        "ids": [],
-        "fingerprint": "",
-    })
+    grouped = defaultdict(
+        lambda: {
+            "count": 0,
+            "source": "",
+            "host": "",
+            "container": "",
+            "level": "",
+            "stream": "",
+            "first_seen": None,
+            "last_seen": None,
+            "examples": [],
+            "ids": [],
+            "fingerprint": "",
+        }
+    )
 
     max_examples = CONFIG["analysis"]["max_examples_per_group"]
 
@@ -277,6 +432,8 @@ def group_events(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
         key = row["fingerprint"]
         g = grouped[key]
         g["count"] += 1
+        g["source"] = row["source"]
+        g["host"] = row["host"]
         g["container"] = row["container"]
         g["level"] = row["level"]
         g["stream"] = row["stream"]
@@ -297,18 +454,20 @@ def group_events(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
 def build_prompt(groups: list[dict[str, Any]]) -> str:
     payload = {
         "instruction": (
-            "You are reviewing homelab Docker log alerts forwarded by Dozzle. "
+            "You are reviewing homelab operational alerts from multiple sources, "
+            "including Docker container logs and Windows Event Logs. "
             "Classify only real operational issues. Be conservative. "
             "Ignore harmless noise. Return strict JSON only."
         ),
         "groups": groups,
     }
     return f"""
-Analyze these grouped container log alerts.
+Analyze these grouped infrastructure alerts.
 
 Rules:
 - Classify each group as: ignore, low, medium, or high.
-- Prefer real operational issues: crashes, permission problems, DB failures, OOM, disk full, network failures, bad gateway, TLS/cert failures, repeated exceptions.
+- Sources may include Docker logs and Windows Event Logs.
+- Prefer real operational issues: crashes, permission problems, DB failures, OOM, disk full, network failures, bad gateway, TLS/cert failures, repeated exceptions, failed logons, unexpected shutdowns, driver resets, service failures.
 - Ignore likely noise.
 - Do not invent problems not supported by the data.
 - Output JSON only with this schema:
@@ -333,22 +492,6 @@ Input:
 """.strip()
 
 
-#def call_ollama(prompt: str) -> dict[str, Any]:
-#    url = CONFIG["ollama"]["url"].rstrip("/") + "/api/generate"
-#    body = {
-#        "model": CONFIG["ollama"]["model"],
-#        "prompt": prompt,
-#        "stream": False,
-#        "format": "json",
-#        "options": {
-#            "temperature": 0.1,
-#        },
-#    }
-#    r = requests.post(url, json=body, timeout=CONFIG["ollama"]["timeout_seconds"])
-#    r.raise_for_status()
-#    data = r.json()
-#    return json.loads(data["response"])
-
 def call_ollama(prompt: str) -> dict[str, Any]:
     url = CONFIG["ollama"]["url"].rstrip("/") + "/api/generate"
     body = {
@@ -364,8 +507,6 @@ def call_ollama(prompt: str) -> dict[str, Any]:
     r = requests.post(url, json=body, timeout=CONFIG["ollama"]["timeout_seconds"])
     r.raise_for_status()
     data = r.json()
-
-    #print(f"[call_ollama] full response json: {data!r}", flush=True)
 
     raw_response = (data.get("response") or "").strip()
     raw_thinking = (data.get("thinking") or "").strip()
@@ -396,6 +537,32 @@ def call_ollama(prompt: str) -> dict[str, Any]:
 
     raise ValueError(f"Could not parse Ollama JSON response. Candidate: {candidate!r}")
 
+
+def call_ollama_text(prompt: str) -> str:
+    url = CONFIG["ollama"]["url"].rstrip("/") + "/api/generate"
+    body = {
+        "model": CONFIG["ollama"]["model"],
+        "prompt": prompt,
+        "stream": False,
+        "options": {
+            "temperature": 0.2,
+        },
+    }
+
+    r = requests.post(url, json=body, timeout=CONFIG["ollama"]["timeout_seconds"])
+    r.raise_for_status()
+    data = r.json()
+
+    raw_response = (data.get("response") or "").strip()
+    raw_thinking = (data.get("thinking") or "").strip()
+
+    text = raw_response or raw_thinking
+    if not text:
+        raise ValueError(f"Ollama returned empty response and empty thinking. Full payload: {data!r}")
+
+    return text
+
+
 def send_ntfy(message: str, priority: str = "default") -> None:
     url = CONFIG["notify"]["ntfy_url"]
     headers = {
@@ -406,6 +573,7 @@ def send_ntfy(message: str, priority: str = "default") -> None:
     r = requests.post(url, data=message.encode("utf-8"), headers=headers, timeout=30)
     if not r.ok:
         raise RuntimeError(f"ntfy error {r.status_code}: {r.text}")
+
 
 def mark_processed(ids: list[int]) -> None:
     if not ids:
@@ -430,15 +598,18 @@ def analyze_once() -> None:
 
     if findings:
         priority = "urgent" if any(f["severity"] == "high" for f in findings) else "default"
-        lines = [result.get("operator_summary", "Log alerts detected."), ""]
+        lines = [result.get("operator_summary", "Infrastructure alerts detected."), ""]
+
         for f in findings[:10]:
             lines.append(f"[{f['severity'].upper()}] {f['container']}: {f['title']}")
             lines.append(f"  {f['summary']}")
             lines.append(f"  Action: {f['action']}")
             lines.append("")
+
         send_ntfy("\n".join(lines).strip(), priority=priority)
 
     mark_processed(all_ids)
+
 
 def analysis_loop() -> None:
     interval = max(60, CONFIG["analysis"]["batch_window_minutes"] * 60)
@@ -465,9 +636,6 @@ def analysis_loop() -> None:
 
         time.sleep(interval)
 
-def today_local_date_str() -> str:
-    return datetime.now().strftime("%Y-%m-%d")
-
 
 def daily_report_already_sent(run_date: str) -> bool:
     with sqlite3.connect(DB_PATH) as conn:
@@ -486,6 +654,7 @@ def mark_daily_report_sent(run_date: str) -> None:
         )
         conn.commit()
 
+
 def fetch_events_for_lookback(hours: int) -> list[sqlite3.Row]:
     cutoff = utcnow() - timedelta(hours=hours)
     with sqlite3.connect(DB_PATH) as conn:
@@ -501,17 +670,22 @@ def fetch_events_for_lookback(hours: int) -> list[sqlite3.Row]:
         ).fetchall()
     return rows
 
+
 def group_events_for_daily(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
-    grouped = defaultdict(lambda: {
-        "count": 0,
-        "container": "",
-        "level": "",
-        "stream": "",
-        "first_seen": None,
-        "last_seen": None,
-        "examples": [],
-        "fingerprint": "",
-    })
+    grouped = defaultdict(
+        lambda: {
+            "count": 0,
+            "source": "",
+            "host": "",
+            "container": "",
+            "level": "",
+            "stream": "",
+            "first_seen": None,
+            "last_seen": None,
+            "examples": [],
+            "fingerprint": "",
+        }
+    )
 
     max_examples = CONFIG["analysis"]["max_examples_per_group"]
 
@@ -519,6 +693,8 @@ def group_events_for_daily(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
         key = row["fingerprint"]
         g = grouped[key]
         g["count"] += 1
+        g["source"] = row["source"]
+        g["host"] = row["host"]
         g["container"] = row["container"]
         g["level"] = row["level"]
         g["stream"] = row["stream"]
@@ -534,6 +710,7 @@ def group_events_for_daily(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
 
     return sorted(grouped.values(), key=lambda x: x["count"], reverse=True)
 
+
 def build_daily_report_prompt(groups: list[dict[str, Any]], lookback_hours: int) -> str:
     payload = {
         "lookback_hours": lookback_hours,
@@ -541,9 +718,9 @@ def build_daily_report_prompt(groups: list[dict[str, Any]], lookback_hours: int)
     }
 
     return f"""
-You are a homelab SRE generating a daily operations digest from container alert events.
+You are a homelab SRE generating a daily operations digest from infrastructure alert events.
 
-Current system date/time: {now_str}
+Current system date/time: {current_system_time_str()}
 Assume this date is correct.
 Do not question or validate the system clock unless the input explicitly shows clock drift evidence.
 
@@ -572,20 +749,20 @@ Summary:
 <2-4 short sentences summarizing the day>
 
 Critical Issues:
-- <container>: <issue> — <brief impact/action>
-- <container>: <issue> — <brief impact/action>
+- <source/container>: <issue> — <brief impact/action>
+- <source/container>: <issue> — <brief impact/action>
 
 Warnings:
-- <container>: <issue> — <brief impact/action>
-- <container>: <issue> — <brief impact/action>
+- <source/container>: <issue> — <brief impact/action>
+- <source/container>: <issue> — <brief impact/action>
 
 Noise / Likely Harmless:
-- <container>: <short description>
-- <container>: <short description>
+- <source/container>: <short description>
+- <source/container>: <short description>
 
 Classification guidance:
-- Critical = service crashes, database failures, repeated connection failures, disk/full filesystem issues, OOM, panic/fatal/segfault, persistent upstream failures
-- Warning = transient errors, rate limits, lock contention, repeated retries, degraded features, missing cache directories
+- Critical = service crashes, database failures, repeated connection failures, disk/full filesystem issues, OOM, panic/fatal/segfault, persistent upstream failures, repeated failed logons, unexpected shutdowns, driver crashes
+- Warning = transient errors, rate limits, lock contention, repeated retries, degraded features, missing cache directories, one-off failed logons, isolated service failures
 - Noise / Likely Harmless = one-off warnings, routine transfer stats, benign retries, expected disconnects, repetitive low-value log spam
 
 Selection rules:
@@ -599,10 +776,10 @@ Input:
 {json.dumps(payload, ensure_ascii=False, indent=2)}
 """.strip()
 
+
 def clean_daily_report_text(text: str) -> str:
     text = text.strip()
 
-    # Remove common chatbot endings
     text = re.sub(
         r"\n*(Would you like.*|Let me know.*|If you want.*|I can help.*)$",
         "",
@@ -610,116 +787,69 @@ def clean_daily_report_text(text: str) -> str:
         flags=re.IGNORECASE | re.DOTALL,
     ).strip()
 
-    # Remove markdown emphasis if the model sneaks it in
     text = text.replace("**", "").replace("### ", "")
 
-    # Ensure status line exists
     if not text.startswith("Overall Status:"):
         text = "Overall Status: Warning\n\n" + text
 
     return text
 
+
 def truncate_for_ntfy(text: str, max_chars: int = 3500) -> str:
-    """
-    ntfy rejects very large messages with HTTP 400.
-    This safely truncates messages to a reasonable size.
-    """
     text = text.strip()
 
     if len(text) <= max_chars:
         return text
 
     truncated = text[:max_chars].rstrip()
-
     return truncated + "\n\n[message truncated]"
+
 
 def send_daily_report() -> None:
     cfg = CONFIG["daily_report"]
     lookback_hours = cfg.get("lookback_hours", 24)
 
-    # Fetch recent events
     rows = fetch_events_for_lookback(lookback_hours)
+    print(f"[daily_report] fetched {len(rows)} rows from last {lookback_hours}h", flush=True)
 
-    print(
-        f"[daily_report] fetched {len(rows)} rows from last {lookback_hours}h",
-        flush=True,
-    )
-
-    # If nothing happened, send healthy report
     if not rows:
         message = (
             "Homelab Daily Health Report\n\n"
             "Overall Status: Healthy\n\n"
-            "No alert-level container events were recorded in the last 24 hours."
+            "No alert-level events were recorded in the last 24 hours."
         )
-
         send_ntfy(message, priority="default")
-
         print("[daily_report] sent healthy empty report", flush=True)
         return
 
-    # Group events for the LLM
     groups = group_events_for_daily(rows)
-
-    # Build prompt
     prompt = build_daily_report_prompt(groups, lookback_hours)
 
     try:
         report_body = call_ollama_text(prompt).strip()
-
         if not report_body:
             raise ValueError("LLM returned empty report")
-
     except Exception as e:
         print(f"[daily_report] LLM failure: {e}", flush=True)
-
         report_body = (
             "Overall Status: Warning\n\n"
-            "Daily report generation failed. Review container logs manually."
+            "Daily report generation failed. Review infrastructure logs manually."
         )
 
     report_body = clean_daily_report_text(report_body)
 
-    # Build final message
     message = f"Homelab Daily Health Report\n\n{report_body}"
     message = truncate_for_ntfy(message, max_chars=3500)
 
-    # Determine ntfy priority
     priority = "default"
-
     if "Overall Status: Critical" in message:
         priority = "urgent"
     elif "Overall Status: Warning" in message:
         priority = "high"
 
     send_ntfy(message, priority=priority)
-
     print("[daily_report] sent daily report", flush=True)
 
-
-def call_ollama_text(prompt: str) -> str:
-    url = CONFIG["ollama"]["url"].rstrip("/") + "/api/generate"
-    body = {
-        "model": CONFIG["ollama"]["model"],
-        "prompt": prompt,
-        "stream": False,
-        "options": {
-            "temperature": 0.2,
-        },
-    }
-
-    r = requests.post(url, json=body, timeout=CONFIG["ollama"]["timeout_seconds"])
-    r.raise_for_status()
-    data = r.json()
-
-    raw_response = (data.get("response") or "").strip()
-    raw_thinking = (data.get("thinking") or "").strip()
-
-    text = raw_response or raw_thinking
-    if not text:
-        raise ValueError(f"Ollama returned empty response and empty thinking. Full payload: {data!r}")
-
-    return text
 
 def maybe_send_daily_report() -> None:
     cfg = CONFIG.get("daily_report", {})
@@ -747,6 +877,7 @@ def daily_report_now():
         return {"ok": True}
     except Exception as e:
         return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
+
 
 def weekly_run_key(now: datetime) -> str:
     year, week, _ = now.isocalendar()
@@ -788,18 +919,21 @@ def fetch_events_for_days(days: int) -> list[sqlite3.Row]:
 
 
 def group_events_for_weekly(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
-    grouped = defaultdict(lambda: {
-        "count": 0,
-        "container": "",
-        "host": "",
-        "level": "",
-        "stream": "",
-        "first_seen": None,
-        "last_seen": None,
-        "examples": [],
-        "fingerprint": "",
-        "days_seen": set(),
-    })
+    grouped = defaultdict(
+        lambda: {
+            "count": 0,
+            "source": "",
+            "container": "",
+            "host": "",
+            "level": "",
+            "stream": "",
+            "first_seen": None,
+            "last_seen": None,
+            "examples": [],
+            "fingerprint": "",
+            "days_seen": set(),
+        }
+    )
 
     max_examples = CONFIG["analysis"]["max_examples_per_group"]
 
@@ -807,6 +941,7 @@ def group_events_for_weekly(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
         key = row["fingerprint"]
         g = grouped[key]
         g["count"] += 1
+        g["source"] = row["source"]
         g["container"] = row["container"]
         g["host"] = row["host"]
         g["level"] = row["level"]
@@ -845,9 +980,9 @@ def build_weekly_report_prompt(groups: list[dict[str, Any]], lookback_days: int)
     }
 
     return f"""
-You are generating a weekly homelab reliability report from Docker alert events.
+You are generating a weekly homelab reliability report from infrastructure alert events.
 
-Current system date/time: {now_str}
+Current system date/time: {current_system_time_str()}
 Assume this date is correct.
 Do not question or validate the system clock unless the input explicitly shows clock drift evidence.
 
@@ -859,12 +994,12 @@ Summary:
 <2-4 short sentences>
 
 Top Recurring Issues:
-- <container>: <issue> — <count/trend/impact>
-- <container>: <issue> — <count/trend/impact>
+- <source/container>: <issue> — <count/trend/impact>
+- <source/container>: <issue> — <count/trend/impact>
 
-Top Noisy Containers:
-- <container>: <short description>
-- <container>: <short description>
+Top Noisy Sources:
+- <source/container>: <short description>
+- <source/container>: <short description>
 
 Recommended Actions:
 - <short operational action>
@@ -898,17 +1033,14 @@ def send_weekly_report() -> None:
         message = (
             "Homelab Weekly Reliability Report\n\n"
             "Overall Status: Healthy\n\n"
-            "No alert-level container events were recorded in the last 7 days."
+            "No alert-level events were recorded in the last 7 days."
         )
         send_ntfy(message, priority="default")
         print("[weekly_report] sent empty healthy report", flush=True)
         return
 
     groups = group_events_for_weekly(rows)
-
-    # Keep the prompt compact and trend-focused
     groups = groups[:20]
-
     prompt = build_weekly_report_prompt(groups, lookback_days)
 
     try:
@@ -945,15 +1077,15 @@ def maybe_send_weekly_report() -> None:
     if weekly_report_already_sent(run_key):
         return
 
-    target_weekday = int(cfg.get("weekday", 0))  # 0=Monday
+    target_weekday = int(cfg.get("weekday", 0))
     target_hour = int(cfg.get("hour", 9))
     target_minute = int(cfg.get("minute", 0))
 
     if (
-        now.weekday() == target_weekday and
-        (
-            now.hour > target_hour or
-            (now.hour == target_hour and now.minute >= target_minute)
+        now.weekday() == target_weekday
+        and (
+            now.hour > target_hour
+            or (now.hour == target_hour and now.minute >= target_minute)
         )
     ):
         send_weekly_report()
@@ -968,15 +1100,18 @@ def weekly_report_now():
     except Exception as e:
         return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
 
+
 def cleanup_old_data() -> None:
     retention = CONFIG.get("retention", {})
     events_days = int(retention.get("events_days", 30))
     daily_runs_days = int(retention.get("daily_runs_days", 180))
     weekly_runs_days = int(retention.get("weekly_runs_days", 365))
+    housekeeping_runs_days = int(retention.get("housekeeping_runs_days", 365))
 
     events_cutoff = (utcnow() - timedelta(days=events_days)).isoformat()
     daily_cutoff = (utcnow() - timedelta(days=daily_runs_days)).isoformat()
     weekly_cutoff = (utcnow() - timedelta(days=weekly_runs_days)).isoformat()
+    housekeeping_cutoff = (utcnow() - timedelta(days=housekeeping_runs_days)).isoformat()
 
     with sqlite3.connect(DB_PATH) as conn:
         cur = conn.cursor()
@@ -990,17 +1125,26 @@ def cleanup_old_data() -> None:
         cur.execute("DELETE FROM weekly_runs WHERE created_at < ?", (weekly_cutoff,))
         deleted_weekly = cur.rowcount
 
+        cur.execute("DELETE FROM housekeeping_runs WHERE created_at < ?", (housekeeping_cutoff,))
+        deleted_housekeeping = cur.rowcount
+
         conn.commit()
 
     print(
-        f"[cleanup] deleted events={deleted_events} daily_runs={deleted_daily} weekly_runs={deleted_weekly}",
+        "[cleanup] deleted "
+        f"events={deleted_events} "
+        f"daily_runs={deleted_daily} "
+        f"weekly_runs={deleted_weekly} "
+        f"housekeeping_runs={deleted_housekeeping}",
         flush=True,
     )
+
 
 def vacuum_db() -> None:
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("VACUUM")
     print("[cleanup] vacuum completed", flush=True)
+
 
 def housekeeping_run_key(prefix: str, now: datetime) -> str:
     return f"{prefix}-{now.strftime('%Y-%m-%d')}"
@@ -1031,10 +1175,10 @@ def maybe_run_cleanup() -> None:
     if housekeeping_already_ran(run_key):
         return
 
-    # run once daily after 03:00
     if now.hour >= 3:
         cleanup_old_data()
         mark_housekeeping_ran(run_key)
+
 
 @app.post("/vacuum-now")
 def vacuum_now():

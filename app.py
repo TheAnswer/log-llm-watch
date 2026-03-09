@@ -15,6 +15,7 @@ import requests
 import yaml
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
+app = FastAPI(title="Homelab LLM Watch")
 
 BASE_DIR = Path("/opt/dozzle-llm-watch")
 CONFIG_PATH = BASE_DIR / "config.yaml"
@@ -35,8 +36,23 @@ DB_PATH = CONFIG["storage"]["db_path"]
 NODE_METADATA = CONFIG.get("node_metadata", {})
 SERVICE_METADATA = CONFIG.get("service_metadata", {})
 
+
+from fastapi.middleware.cors import CORSMiddleware
+
 app = FastAPI(title="Homelab LLM Watch")
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=8088)
 
 def init_db() -> None:
     Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
@@ -2793,7 +2809,49 @@ def api_analyze_missing_incidents(
             },
         )
 
-if __name__ == "__main__":
-    import uvicorn
+@app.get("/tool/health")
+def tool_health():
+    return generate_open_incidents_digest(limit=10, include_raw_response=False)
 
-    uvicorn.run(app, host="0.0.0.0", port=8088)
+
+@app.get("/tool/open-incidents")
+def tool_open_incidents(limit: int = 20):
+    return api_incidents(status="open", limit=limit)
+
+
+@app.get("/tool/incident/{incident_id}")
+def tool_incident(incident_id: int):
+    return api_incident_detail(incident_id=incident_id, event_limit=50)
+
+
+@app.get("/tool/incident/{incident_id}/context")
+def tool_incident_context(incident_id: int):
+    return build_incident_llm_context(
+        incident_id=incident_id,
+        event_limit=12,
+        nearby_limit=60,
+        similar_limit=5,
+        minutes_before=2,
+        minutes_after=10,
+    )
+
+
+@app.post("/tool/incident/{incident_id}/analyze")
+def tool_incident_analyze(incident_id: int):
+    try:
+        return analyze_incident_with_ollama(
+            incident_id=incident_id,
+            persist_summary=True,
+            include_raw_response=False,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={
+                "ok": False,
+                "incident_id": incident_id,
+                "error": str(e),
+            },
+        )

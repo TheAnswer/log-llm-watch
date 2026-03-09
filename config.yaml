@@ -52,3 +52,4 @@ filters:
     - '(?i)metrics'
     - '(?i)broadcast failed'
     - '(?i)http server disconnected while reading the response'
+    - '(?i)\busbhid-ups\b.*\bInput/Output Error\b'

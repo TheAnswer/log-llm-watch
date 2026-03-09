@@ -51,3 +51,4 @@ filters:
     - '(?i)favicon'
     - '(?i)metrics'
     - '(?i)broadcast failed'
+    - '(?i)http server disconnected while reading the response'

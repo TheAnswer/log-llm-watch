@@ -36,6 +36,62 @@ retention:
   housekeeping_runs_days: 365
   analysis_runs_days: 30
 
+incidents:
+  open_window_minutes: 10
+  close_after_minutes: 30
+
+node_metadata:
+  unraid:
+    host_type: unraid
+    role: storage
+    subnet: 192.168.2.0/24
+
+  proxmox:
+    host_type: proxmox
+    role: hypervisor
+    subnet: 192.168.2.0/24
+
+  proxmox-venus:
+    host_type: proxmox
+    role: hypervisor
+    subnet: 192.168.2.0/24
+
+  theanswer-standard-pc-q35-ich9-2009:
+    host_type: vm
+    role: observability
+    subnet: 192.168.2.0/24
+
+  theanswer-pc:
+    host_type: windows
+    role: workstation
+    subnet: 192.168.2.0/24
+
+  TheAnswer-PC:
+    host_type: windows
+    role: workstation
+    subnet: 192.168.2.0/24
+
+  THEANSWER-PC:
+    host_type: windows
+    role: workstation
+    subnet: 192.168.2.0/24
+
+service_metadata:
+  nxlog-unraid:
+    app_stack: monitoring
+
+  dozzle-webhook:
+    app_stack: monitoring
+
+  ntfy:
+    app_stack: notifications
+
+  nginx-proxy-manager:
+    app_stack: proxy
+
+  syslog:
+    app_stack: monitoring
+
 notify:
   method: ntfy
   ntfy_url: http://localhost:2586/nas_log_alerts
@@ -53,3 +109,7 @@ filters:
     - '(?i)broadcast failed'
     - '(?i)http server disconnected while reading the response'
     - '(?i)\busbhid-ups\b.*\bInput/Output Error\b'
+    - '(?i)\bmonitor_nchan: Stop running nchan processes\b'
+    - '(?i)\bautofan: Highest disk temp is\b'
+    - '(?i)\bmonitor_nchan: Stop running nchan processes\b'
+    - '(?i)\bupsd\[\d+\]: User .* logged into UPS \[ups\]\b'

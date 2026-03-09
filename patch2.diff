@@ -1,0 +1,270 @@
+--- app.py
++++ app.py
+@@
+ def close_stale_incidents() -> None:
+     cfg = CONFIG.get("incidents", {})
+     stale_minutes = int(cfg.get("close_after_minutes", 30))
+     cutoff = (utcnow() - timedelta(minutes=stale_minutes)).isoformat()
+     with db() as conn:
+         conn.execute(
+             """
+             UPDATE incidents
+             SET status = 'closed',
+                 updated_at = ?
+             WHERE status = 'open'
+               AND last_seen < ?
+             """,
+             (utcnow().isoformat(), cutoff),
+         )
+         conn.commit()
++
++
++def get_representative_incident_events(
++    conn: sqlite3.Connection,
++    incident_id: int,
++    limit: int = 20,
++) -> list[sqlite3.Row]:
++    """
++    Return a compact but representative sample of events for an incident:
++    earliest few, latest few, and most recent remainder if needed.
++    """
++    limit = max(1, min(limit, 100))
++    conn.row_factory = sqlite3.Row
++
++    if limit <= 6:
++        return conn.execute(
++            """
++            SELECT id, ts, created_at, source, host, container, stream, level,
++                   severity_norm, event_class, dependency, message,
++                   message_template, canonical_fingerprint
++            FROM events
++            WHERE incident_id = ?
++            ORDER BY ts ASC, id ASC
++            LIMIT ?
++            """,
++            (incident_id, limit),
++        ).fetchall()
++
++    early_n = min(5, limit // 2)
++    late_n = min(5, max(1, limit - early_n))
++
++    early = conn.execute(
++        """
++        SELECT id, ts, created_at, source, host, container, stream, level,
++               severity_norm, event_class, dependency, message,
++               message_template, canonical_fingerprint
++        FROM events
++        WHERE incident_id = ?
++        ORDER BY ts ASC, id ASC
++        LIMIT ?
++        """,
++        (incident_id, early_n),
++    ).fetchall()
++
++    late = conn.execute(
++        """
++        SELECT id, ts, created_at, source, host, container, stream, level,
++               severity_norm, event_class, dependency, message,
++               message_template, canonical_fingerprint
++        FROM events
++        WHERE incident_id = ?
++        ORDER BY ts DESC, id DESC
++        LIMIT ?
++        """,
++        (incident_id, late_n),
++    ).fetchall()
++
++    merged: dict[int, sqlite3.Row] = {}
++    for row in early:
++        merged[int(row["id"])] = row
++    for row in late:
++        merged[int(row["id"])] = row
++
++    rows = sorted(merged.values(), key=lambda r: (r["ts"] or "", r["id"]))
++    if len(rows) >= limit:
++        return rows[:limit]
++
++    remaining = limit - len(rows)
++    existing_ids = sorted(merged.keys())
++
++    if existing_ids:
++        placeholders = ",".join("?" for _ in existing_ids)
++        sql = f"""
++        SELECT id, ts, created_at, source, host, container, stream, level,
++               severity_norm, event_class, dependency, message,
++               message_template, canonical_fingerprint
++        FROM events
++        WHERE incident_id = ?
++          AND id NOT IN ({placeholders})
++        ORDER BY ts DESC, id DESC
++        LIMIT ?
++        """
++        params: list[Any] = [incident_id, *existing_ids, remaining]
++    else:
++        sql = """
++        SELECT id, ts, created_at, source, host, container, stream, level,
++               severity_norm, event_class, dependency, message,
++               message_template, canonical_fingerprint
++        FROM events
++        WHERE incident_id = ?
++        ORDER BY ts DESC, id DESC
++        LIMIT ?
++        """
++        params = [incident_id, remaining]
++
++    more = conn.execute(sql, params).fetchall()
++    for row in more:
++        merged[int(row["id"])] = row
++
++    return sorted(merged.values(), key=lambda r: (r["ts"] or "", r["id"]))[:limit]
++
++
++def build_incident_context(
++    conn: sqlite3.Connection,
++    incident_id: int,
++    event_limit: int = 20,
++    nearby_limit: int = 100,
++    similar_limit: int = 10,
++    minutes_before: int = 2,
++    minutes_after: int = 5,
++) -> dict[str, Any]:
++    conn.row_factory = sqlite3.Row
++
++    incident = conn.execute(
++        "SELECT * FROM incidents WHERE id = ?",
++        (incident_id,),
++    ).fetchone()
++    if not incident:
++        raise HTTPException(status_code=404, detail="Incident not found")
++
++    representative_events = get_representative_incident_events(
++        conn,
++        incident_id=incident_id,
++        limit=event_limit,
++    )
++
++    try:
++        first_seen_dt = datetime.fromisoformat(str(incident["first_seen"]).replace("Z", "+00:00"))
++    except Exception:
++        first_seen_dt = utcnow()
++
++    try:
++        last_seen_dt = datetime.fromisoformat(str(incident["last_seen"]).replace("Z", "+00:00"))
++    except Exception:
++        last_seen_dt = first_seen_dt
++
++    nearby_start = (first_seen_dt - timedelta(minutes=max(0, minutes_before))).isoformat()
++    nearby_end = (last_seen_dt + timedelta(minutes=max(0, minutes_after))).isoformat()
++
++    nearby_events = conn.execute(
++        """
++        SELECT id, ts, created_at, source, host, container, stream, level,
++               severity_norm, event_class, dependency, message, incident_id
++        FROM events
++        WHERE ts >= ? AND ts <= ?
++        ORDER BY ts ASC, id ASC
++        LIMIT ?
++        """,
++        (nearby_start, nearby_end, max(1, min(nearby_limit, 500))),
++    ).fetchall()
++
++    similar_incidents = conn.execute(
++        """
++        SELECT id, status, severity, title, event_class, first_seen, last_seen,
++               event_count, affected_nodes, affected_services, root_cause_candidates,
++               summary, metadata
++        FROM incidents
++        WHERE primary_fingerprint = ?
++          AND id != ?
++        ORDER BY last_seen DESC
++        LIMIT ?
++        """,
++        (
++            incident["primary_fingerprint"],
++            incident_id,
++            max(1, min(similar_limit, 50)),
++        ),
++    ).fetchall()
++
++    return {
++        "incident": {
++            "id": incident["id"],
++            "status": incident["status"],
++            "severity": incident["severity"],
++            "title": incident["title"],
++            "event_class": incident["event_class"],
++            "primary_fingerprint": incident["primary_fingerprint"],
++            "first_seen": incident["first_seen"],
++            "last_seen": incident["last_seen"],
++            "event_count": incident["event_count"],
++            "affected_nodes": safe_json_loads(incident["affected_nodes"], []),
++            "affected_services": safe_json_loads(incident["affected_services"], []),
++            "root_cause_candidates": safe_json_loads(incident["root_cause_candidates"], []),
++            "summary": incident["summary"] or "",
++            "metadata": safe_json_loads(incident["metadata"], {}),
++        },
++        "representative_events": [dict(row) for row in representative_events],
++        "nearby_events": [dict(row) for row in nearby_events],
++        "similar_incidents": [
++            {
++                "id": row["id"],
++                "status": row["status"],
++                "severity": row["severity"],
++                "title": row["title"],
++                "event_class": row["event_class"],
++                "first_seen": row["first_seen"],
++                "last_seen": row["last_seen"],
++                "event_count": row["event_count"],
++                "affected_nodes": safe_json_loads(row["affected_nodes"], []),
++                "affected_services": safe_json_loads(row["affected_services"], []),
++                "root_cause_candidates": safe_json_loads(row["root_cause_candidates"], []),
++                "summary": row["summary"] or "",
++                "metadata": safe_json_loads(row["metadata"], {}),
++            }
++            for row in similar_incidents
++        ],
++        "window": {
++            "nearby_start": nearby_start,
++            "nearby_end": nearby_end,
++            "minutes_before": minutes_before,
++            "minutes_after": minutes_after,
++        },
++    }
+@@
+ @app.get("/api/incidents/{incident_id}")
+ def api_incident_detail(incident_id: int, event_limit: int = 50):
+     event_limit = max(1, min(event_limit, 200))
+     with sqlite3.connect(DB_PATH) as conn:
+         conn.row_factory = sqlite3.Row
+@@
+     return {
+         "incident": {
+             "id": incident["id"],
+             "status": incident["status"],
+             "severity": incident["severity"],
+@@
+         },
+         "events": [dict(row) for row in events],
+     }
++
++
++@app.get("/api/incidents/{incident_id}/context")
++def api_incident_context(
++    incident_id: int,
++    event_limit: int = 20,
++    nearby_limit: int = 100,
++    similar_limit: int = 10,
++    minutes_before: int = 2,
++    minutes_after: int = 5,
++):
++    with sqlite3.connect(DB_PATH) as conn:
++        return build_incident_context(
++            conn,
++            incident_id=incident_id,
++            event_limit=max(1, min(event_limit, 100)),
++            nearby_limit=max(1, min(nearby_limit, 500)),
++            similar_limit=max(1, min(similar_limit, 50)),
++            minutes_before=max(0, min(minutes_before, 60)),
++            minutes_after=max(0, min(minutes_after, 120)),
++        )
+

@@ -13,7 +13,7 @@ from typing import Any
 import requests
 import yaml
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
 BASE_DIR = Path("/opt/dozzle-llm-watch")
 CONFIG_PATH = BASE_DIR / "config.yaml"
@@ -1269,3 +1269,71 @@ def store_analysis_run(
             ),
         )
         conn.commit()
+
+
+def extract_syslog_event(payload: Any) -> dict[str, str]:
+    source = "syslog"
+    host = ""
+    container = "syslog"
+    stream = ""
+    level = ""
+    message = ""
+
+    if not isinstance(payload, dict):
+        return {
+            "source": source,
+            "host": host,
+            "container": container,
+            "stream": stream,
+            "level": level,
+            "message": json.dumps(payload, ensure_ascii=False),
+        }
+
+    host = str(payload.get("host") or payload.get("hostname") or "").lower()
+
+    program = payload.get("program") or payload.get("appname") or payload.get("tag") or "syslog"
+
+    container = str(program)
+
+    message = str(payload.get("message") or payload.get("msg") or "").strip()
+
+    lowered = message.lower()
+
+    if any(x in lowered for x in ["panic", "fatal", "segfault", "oom", "out of memory"]):
+        level = "critical"
+    elif any(x in lowered for x in ["error", "failed", "exception"]):
+        level = "error"
+    elif "warn" in lowered:
+        level = "warning"
+
+    return {
+        "source": source,
+        "host": host,
+        "container": container,
+        "stream": "",
+        "level": level,
+        "message": message,
+    }
+
+@app.post("/syslog")
+async def syslog_webhook(request: Request):
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Expected JSON body")
+
+    event = extract_syslog_event(payload)
+
+    if should_ignore(event["message"]):
+        return JSONResponse({"stored": False, "reason": "ignored"})
+
+    fp = store_event(payload, event)
+
+    return JSONResponse(
+        {
+            "stored": True,
+            "source": event["source"],
+            "container": event["container"],
+            "fingerprint": fp,
+        }
+    )

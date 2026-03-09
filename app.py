@@ -84,6 +84,23 @@ def init_db() -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS analysis_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL,
+                prompt TEXT NOT NULL,
+                raw_response TEXT NOT NULL,
+                parsed_json TEXT,
+                overall_status TEXT,
+                finding_count INTEGER NOT NULL DEFAULT 0,
+                event_count INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_analysis_runs_created_at ON analysis_runs(created_at)"
+        )
         conn.commit()
 
 
@@ -491,8 +508,7 @@ Input:
 {json.dumps(payload, ensure_ascii=False, indent=2)}
 """.strip()
 
-
-def call_ollama(prompt: str) -> dict[str, Any]:
+def call_ollama(prompt: str) -> tuple[dict[str, Any], str]:
     url = CONFIG["ollama"]["url"].rstrip("/") + "/api/generate"
     body = {
         "model": CONFIG["ollama"]["model"],
@@ -516,27 +532,29 @@ def call_ollama(prompt: str) -> dict[str, Any]:
     if not candidate:
         raise ValueError(f"Ollama returned empty response and empty thinking. Full payload: {data!r}")
 
+    cleaned = candidate
+
     try:
-        return json.loads(candidate)
+        return json.loads(cleaned), cleaned
     except json.JSONDecodeError:
         pass
 
-    if candidate.startswith("```"):
-        candidate = re.sub(r"^```[a-zA-Z0-9_-]*\n?", "", candidate)
-        candidate = re.sub(r"\n?```$", "", candidate).strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```[a-zA-Z0-9_-]*\n?", "", cleaned)
+        cleaned = re.sub(r"\n?```$", "", cleaned).strip()
 
     try:
-        return json.loads(candidate)
+        return json.loads(cleaned), candidate
     except json.JSONDecodeError:
         pass
 
-    start = candidate.find("{")
-    end = candidate.rfind("}")
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
     if start != -1 and end != -1 and end > start:
-        return json.loads(candidate[start:end + 1])
+        extracted = cleaned[start:end + 1]
+        return json.loads(extracted), candidate
 
     raise ValueError(f"Could not parse Ollama JSON response. Candidate: {candidate!r}")
-
 
 def call_ollama_text(prompt: str) -> str:
     url = CONFIG["ollama"]["url"].rstrip("/") + "/api/generate"
@@ -591,10 +609,26 @@ def analyze_once() -> None:
 
     groups = group_events(rows)
     prompt = build_prompt(groups)
-    result = call_ollama(prompt)
+    all_ids = [row["id"] for row in rows]
+
+    try:
+        result, raw_response = call_ollama(prompt)
+        store_analysis_run(
+            prompt=prompt,
+            raw_response=raw_response,
+            parsed_result=result,
+            event_count=len(rows),
+        )
+    except Exception as e:
+        store_analysis_run(
+            prompt=prompt,
+            raw_response=f"ERROR: {e}",
+            parsed_result=None,
+            event_count=len(rows),
+        )
+        raise
 
     findings = [f for f in result.get("findings", []) if f.get("severity") in {"low", "medium", "high"}]
-    all_ids = [row["id"] for row in rows]
 
     if findings:
         priority = "urgent" if any(f["severity"] == "high" for f in findings) else "default"
@@ -609,7 +643,6 @@ def analyze_once() -> None:
         send_ntfy("\n".join(lines).strip(), priority=priority)
 
     mark_processed(all_ids)
-
 
 def analysis_loop() -> None:
     interval = max(60, CONFIG["analysis"]["batch_window_minutes"] * 60)
@@ -1107,6 +1140,8 @@ def cleanup_old_data() -> None:
     daily_runs_days = int(retention.get("daily_runs_days", 180))
     weekly_runs_days = int(retention.get("weekly_runs_days", 365))
     housekeeping_runs_days = int(retention.get("housekeeping_runs_days", 365))
+    analysis_runs_days = int(retention.get("analysis_runs_days", 30))
+    analysis_runs_cutoff = (utcnow() - timedelta(days=analysis_runs_days)).isoformat()
 
     events_cutoff = (utcnow() - timedelta(days=events_days)).isoformat()
     daily_cutoff = (utcnow() - timedelta(days=daily_runs_days)).isoformat()
@@ -1128,6 +1163,9 @@ def cleanup_old_data() -> None:
         cur.execute("DELETE FROM housekeeping_runs WHERE created_at < ?", (housekeeping_cutoff,))
         deleted_housekeeping = cur.rowcount
 
+        cur.execute("DELETE FROM analysis_runs WHERE created_at < ?", (analysis_runs_cutoff,))
+        deleted_analysis_runs = cur.rowcount
+
         conn.commit()
 
     print(
@@ -1135,10 +1173,10 @@ def cleanup_old_data() -> None:
         f"events={deleted_events} "
         f"daily_runs={deleted_daily} "
         f"weekly_runs={deleted_weekly} "
-        f"housekeeping_runs={deleted_housekeeping}",
+        f"housekeeping_runs={deleted_housekeeping} "
+        f"analysis_runs={deleted_analysis_runs}",
         flush=True,
     )
-
 
 def vacuum_db() -> None:
     with sqlite3.connect(DB_PATH) as conn:
@@ -1187,3 +1225,47 @@ def vacuum_now():
         return {"ok": True}
     except Exception as e:
         return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
+
+
+def store_analysis_run(
+    prompt: str,
+    raw_response: str,
+    parsed_result: dict[str, Any] | None,
+    event_count: int,
+) -> None:
+    overall_status = None
+    finding_count = 0
+    parsed_json = None
+
+    if parsed_result is not None:
+        overall_status = parsed_result.get("overall_status")
+        findings = parsed_result.get("findings", [])
+        if isinstance(findings, list):
+            finding_count = len(findings)
+        parsed_json = json.dumps(parsed_result, ensure_ascii=False)
+
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO analysis_runs (
+                created_at,
+                prompt,
+                raw_response,
+                parsed_json,
+                overall_status,
+                finding_count,
+                event_count
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                utcnow().isoformat(),
+                prompt,
+                raw_response,
+                parsed_json,
+                overall_status,
+                finding_count,
+                event_count,
+            ),
+        )
+        conn.commit()

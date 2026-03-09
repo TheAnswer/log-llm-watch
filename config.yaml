@@ -34,6 +34,7 @@ retention:
   daily_runs_days: 180
   weekly_runs_days: 365
   housekeeping_runs_days: 365
+  analysis_runs_days: 30
 
 notify:
   method: ntfy

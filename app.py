@@ -54,6 +54,11 @@ _SUPPRESS_EC_HOST: set[tuple[str, str]] = set() # match_type='event_class_host'
 _SUPPRESS_REGEX: list[re.Pattern] = []          # match_type='message_regex'
 _SUPPRESS_LOCK = threading.Lock()
 
+# LLM-auto-noise cache — fingerprints the LLM has rated 'ignore', with expiry
+_NOISE_FP: set[str] = set()
+_NOISE_LOCK = threading.Lock()
+LLM_NOISE_TTL_DAYS = 3
+
 
 def _load_suppressed_fingerprints() -> None:
     """Reload all in-memory suppression caches from the DB."""
@@ -89,6 +94,44 @@ def _load_suppressed_fingerprints() -> None:
         print(f"[suppress] Failed to load suppress rules: {e}", flush=True)
 
 
+def _load_noise_fingerprints() -> None:
+    """Reload the LLM noise cache from DB (non-expired entries only)."""
+    try:
+        now_iso = utcnow().isoformat()
+        with sqlite3.connect(DB_PATH) as conn:
+            rows = conn.execute(
+                "SELECT fingerprint FROM llm_noise_fingerprints WHERE suppressed_until > ?",
+                (now_iso,),
+            ).fetchall()
+        fp = {row[0] for row in rows}
+        with _NOISE_LOCK:
+            _NOISE_FP.clear()
+            _NOISE_FP.update(fp)
+    except Exception as e:
+        print(f"[noise_cache] Failed to load: {e}", flush=True)
+
+
+def _upsert_noise_fingerprints(fingerprints: list[str]) -> None:
+    """Mark fingerprints as LLM-noise with a TTL, then reload the cache."""
+    if not fingerprints:
+        return
+    now = utcnow()
+    suppressed_until = (now + timedelta(days=LLM_NOISE_TTL_DAYS)).isoformat()
+    now_iso = now.isoformat()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.executemany(
+            """
+            INSERT INTO llm_noise_fingerprints (fingerprint, suppressed_until, created_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(fingerprint) DO UPDATE SET suppressed_until=excluded.suppressed_until
+            """,
+            [(fp, suppressed_until, now_iso) for fp in fingerprints],
+        )
+        conn.commit()
+    _load_noise_fingerprints()
+    print(f"[noise_cache] suppressed {len(fingerprints)} fingerprint(s) for {LLM_NOISE_TTL_DAYS}d", flush=True)
+
+
 def _run_backfill() -> None:
     try:
         while True:
@@ -116,6 +159,7 @@ def _check_ollama_health() -> None:
 async def lifespan(_app: FastAPI):
     init_db()
     _load_suppressed_fingerprints()
+    _load_noise_fingerprints()
     _check_ollama_health()
     threading.Thread(target=_run_backfill, daemon=True).start()
     threading.Thread(target=analysis_loop, daemon=True).start()
@@ -301,6 +345,16 @@ def init_db() -> None:
         add_column_if_missing("suppress_rules", "match_type", "TEXT NOT NULL DEFAULT 'fingerprint'")
         add_column_if_missing("suppress_rules", "match_host", "TEXT NOT NULL DEFAULT ''")
         add_column_if_missing("suppress_rules", "match_pattern", "TEXT NOT NULL DEFAULT ''")
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS llm_noise_fingerprints (
+                fingerprint TEXT PRIMARY KEY,
+                suppressed_until TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
         conn.commit()
 
 
@@ -1323,9 +1377,25 @@ def analyze_once() -> None:
     if len(rows) < CONFIG["analysis"]["min_events_before_analysis"]:
         return
 
-    groups = group_events(rows)
-    prompt = build_prompt(groups)
     all_ids = [row["id"] for row in rows]
+    all_groups = group_events(rows)
+
+    # Split groups: skip ones the LLM already rated as noise (still mark processed)
+    with _NOISE_LOCK:
+        noise_fp = set(_NOISE_FP)
+
+    live_groups = [g for g in all_groups if g["fingerprint"] not in noise_fp]
+    noise_ids = [id_ for g in all_groups if g["fingerprint"] in noise_fp for id_ in g["ids"]]
+
+    if noise_ids:
+        mark_processed(noise_ids)
+        print(f"[analyze_once] skipped {len(noise_ids)} event(s) across {len(all_groups) - len(live_groups)} noise group(s)", flush=True)
+
+    if not live_groups:
+        return
+
+    prompt = build_prompt(live_groups)
+    live_ids = [id_ for g in live_groups for id_ in g["ids"]]
 
     try:
         result, raw_response = call_ollama(prompt)
@@ -1333,18 +1403,24 @@ def analyze_once() -> None:
             prompt=prompt,
             raw_response=raw_response,
             parsed_result=result,
-            event_count=len(rows),
+            event_count=len(live_ids),
         )
     except Exception as e:
         store_analysis_run(
             prompt=prompt,
             raw_response=f"ERROR: {e}",
             parsed_result=None,
-            event_count=len(rows),
+            event_count=len(live_ids),
         )
         raise
 
-    findings = [f for f in result.get("findings", []) if f.get("severity") in {"low", "medium", "high"}]
+    all_findings = result.get("findings", [])
+    findings = [f for f in all_findings if f.get("severity") in {"low", "medium", "high"}]
+
+    # Auto-suppress fingerprints the LLM rated as ignore
+    ignored_fps = [f["fingerprint"] for f in all_findings if f.get("severity") == "ignore" and f.get("fingerprint")]
+    if ignored_fps:
+        _upsert_noise_fingerprints(ignored_fps)
 
     if findings:
         priority = "urgent" if any(f["severity"] == "high" for f in findings) else "default"
@@ -1358,7 +1434,7 @@ def analyze_once() -> None:
 
         send_ntfy("\n".join(lines).strip(), priority=priority)
 
-    mark_processed(all_ids)
+    mark_processed(live_ids)
 
 
 def analysis_loop() -> None:
@@ -1895,7 +1971,14 @@ def cleanup_old_data() -> None:
         cur.execute("DELETE FROM analysis_runs WHERE created_at < ?", (analysis_runs_cutoff,))
         deleted_analysis_runs = cur.rowcount
 
+        now_iso = utcnow().isoformat()
+        cur.execute("DELETE FROM llm_noise_fingerprints WHERE suppressed_until <= ?", (now_iso,))
+        deleted_noise = cur.rowcount
+
         conn.commit()
+
+    if deleted_noise:
+        _load_noise_fingerprints()
 
     print(
         "[cleanup] deleted "
@@ -1903,7 +1986,8 @@ def cleanup_old_data() -> None:
         f"daily_runs={deleted_daily} "
         f"weekly_runs={deleted_weekly} "
         f"housekeeping_runs={deleted_housekeeping} "
-        f"analysis_runs={deleted_analysis_runs}",
+        f"analysis_runs={deleted_analysis_runs} "
+        f"noise_cache={deleted_noise}",
         flush=True,
     )
 

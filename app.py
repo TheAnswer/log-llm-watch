@@ -44,6 +44,9 @@ _IGNORE_PATTERNS: list[re.Pattern] = [
 # Serialise all Ollama calls — prevents concurrent requests to the local model
 _OLLAMA_LOCK = threading.Lock()
 
+# Serialise incident SELECT+INSERT to prevent duplicate creation under concurrent ingest
+_INCIDENT_LOCK = threading.Lock()
+
 
 def _run_backfill() -> None:
     try:
@@ -812,7 +815,7 @@ def extract_syslog_event(payload: Any) -> dict[str, str]:
 def store_event(payload: Any, event: dict[str, str]) -> str:
     enriched = enrich_event(event)
 
-    with db() as conn:
+    with _INCIDENT_LOCK, db() as conn:
         incident_id = attach_or_create_incident(conn, enriched)
         conn.execute(
             """
@@ -835,12 +838,11 @@ def store_event(payload: Any, event: dict[str, str]) -> str:
                 dependency,
                 canonical_fingerprint,
                 incident_id,
-                noise_score,
                 severity_norm,
                 message_template,
                 labels
             )
-            VALUES (?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 utcnow().isoformat(),
@@ -860,7 +862,6 @@ def store_event(payload: Any, event: dict[str, str]) -> str:
                 enriched["dependency"],
                 enriched["canonical_fingerprint"],
                 incident_id,
-                0.0,
                 enriched["severity_norm"],
                 enriched["message_template"],
                 enriched["labels"],
@@ -1978,18 +1979,21 @@ def build_incident_context(
             (window_start, window_end, max(1, min(nearby_limit, 500))),
         ).fetchall()
 
+        similar_cutoff = (utcnow() - timedelta(days=90)).isoformat()
         similar_incidents = conn.execute(
             """
             SELECT *
             FROM incidents
             WHERE primary_fingerprint = ?
               AND id != ?
+              AND last_seen >= ?
             ORDER BY last_seen DESC
             LIMIT ?
             """,
             (
                 incident["primary_fingerprint"],
                 incident_id,
+                similar_cutoff,
                 max(1, min(similar_limit, 50)),
             ),
         ).fetchall()
@@ -2059,7 +2063,7 @@ def build_incident_context_filtered(
     exclude_info: bool = True,
     exclude_unknown: bool = True,
     exclude_noise: bool = True,
-    exclude_same_incident_from_nearby: bool = False,
+    exclude_same_incident_from_nearby: bool = True,
 ) -> dict[str, Any]:
     base = build_incident_context(
         incident_id=incident_id,

@@ -101,5 +101,4 @@ filters:
     - '(?i)\busbhid-ups\b.*\bInput/Output Error\b'
     - '(?i)\bmonitor_nchan: Stop running nchan processes\b'
     - '(?i)\bautofan: Highest disk temp is\b'
-    - '(?i)\bmonitor_nchan: Stop running nchan processes\b'
     - '(?i)\bupsd\[\d+\]: User .* logged into UPS \[ups\]\b'

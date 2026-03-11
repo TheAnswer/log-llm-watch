@@ -110,7 +110,8 @@ def template_to_suppress_pattern(template: str) -> str:
     result = []
     for part in parts:
         if re.match(r"^<[^>]+>$", part):
-            result.append(r"\S+")
+            # Allow one optional space inside token — handles timestamps like "2026-03-11 17:21:36"
+            result.append(r"\S+(?:[ ]\S+)?")
         else:
             result.append(re.escape(part))
     return "(?i)" + "".join(result)

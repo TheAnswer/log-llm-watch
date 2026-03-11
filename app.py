@@ -6,7 +6,7 @@ import sqlite3
 import threading
 import time
 from collections import defaultdict
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -14,8 +14,8 @@ from typing import Any
 import requests
 import yaml
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-app = FastAPI(title="Homelab LLM Watch")
 
 BASE_DIR = Path("/opt/dozzle-llm-watch")
 CONFIG_PATH = BASE_DIR / "config.yaml"
@@ -36,10 +36,35 @@ DB_PATH = CONFIG["storage"]["db_path"]
 NODE_METADATA = CONFIG.get("node_metadata", {})
 SERVICE_METADATA = CONFIG.get("service_metadata", {})
 
+# Pre-compile ignore patterns once at startup
+_IGNORE_PATTERNS: list[re.Pattern] = [
+    re.compile(p) for p in CONFIG["filters"]["ignore_message_regex"]
+]
 
-from fastapi.middleware.cors import CORSMiddleware
+# Serialise all Ollama calls — prevents concurrent requests to the local model
+_OLLAMA_LOCK = threading.Lock()
 
-app = FastAPI(title="Homelab LLM Watch")
+
+def _run_backfill() -> None:
+    try:
+        while True:
+            n = backfill_existing_events(limit=500)
+            if n == 0:
+                break
+            print(f"[startup] backfilled {n} historical events", flush=True)
+    except Exception as e:
+        print(f"[startup] backfill error: {e}", flush=True)
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    init_db()
+    threading.Thread(target=_run_backfill, daemon=True).start()
+    threading.Thread(target=analysis_loop, daemon=True).start()
+    yield
+
+
+app = FastAPI(title="Homelab LLM Watch", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -48,11 +73,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-if __name__ == "__main__":
-    import uvicorn
-
-    uvicorn.run(app, host="0.0.0.0", port=8088)
 
 def init_db() -> None:
     Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
@@ -560,10 +580,7 @@ def close_stale_incidents() -> None:
 
 
 def should_ignore(message: str) -> bool:
-    for pattern in CONFIG["filters"]["ignore_message_regex"]:
-        if re.search(pattern, message):
-            return True
-    return False
+    return any(p.search(message) for p in _IGNORE_PATTERNS)
 
 
 def extract_dozzle_event(payload: Any) -> dict[str, str]:
@@ -930,22 +947,6 @@ def backfill_existing_events(limit: int = 500) -> int:
         return updated
 
 
-@app.on_event("startup")
-def startup_event():
-    init_db()
-    try:
-        while True:
-            n = backfill_existing_events(limit=500)
-            if n == 0:
-                break
-            print(f"[startup] backfilled {n} historical events", flush=True)
-    except Exception as e:
-        print(f"[startup] backfill error: {e}", flush=True)
-
-    t = threading.Thread(target=analysis_loop, daemon=True)
-    t.start()
-
-
 @app.get("/healthz")
 def healthz():
     return {"ok": True}
@@ -1136,7 +1137,8 @@ def call_ollama(prompt: str) -> tuple[dict[str, Any], str]:
         },
     }
 
-    r = requests.post(url, json=body, timeout=CONFIG["ollama"]["timeout_seconds"])
+    with _OLLAMA_LOCK:
+        r = requests.post(url, json=body, timeout=CONFIG["ollama"]["timeout_seconds"])
     r.raise_for_status()
     data = r.json()
 
@@ -1184,7 +1186,8 @@ def call_ollama_text(prompt: str) -> str:
         },
     }
 
-    r = requests.post(url, json=body, timeout=CONFIG["ollama"]["timeout_seconds"])
+    with _OLLAMA_LOCK:
+        r = requests.post(url, json=body, timeout=CONFIG["ollama"]["timeout_seconds"])
     r.raise_for_status()
     data = r.json()
 
@@ -2466,6 +2469,29 @@ def api_incidents(status: str = "open", limit: int = 20):
     return {"items": items}
 
 
+@app.patch("/api/incidents/{incident_id}")
+def api_update_incident(incident_id: int, status: str):
+    allowed = {"open", "closed"}
+    if status not in allowed:
+        raise HTTPException(status_code=400, detail=f"status must be one of {allowed}")
+
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        incident = conn.execute(
+            "SELECT id FROM incidents WHERE id = ?", (incident_id,)
+        ).fetchone()
+        if not incident:
+            raise HTTPException(status_code=404, detail="Incident not found")
+
+        conn.execute(
+            "UPDATE incidents SET status = ?, updated_at = ? WHERE id = ?",
+            (status, utcnow().isoformat(), incident_id),
+        )
+        conn.commit()
+
+    return {"ok": True, "incident_id": incident_id, "status": status}
+
+
 @app.get("/api/incidents/{incident_id}")
 def api_incident_detail(incident_id: int, event_limit: int = 50):
     event_limit = max(1, min(event_limit, 200))
@@ -2855,3 +2881,9 @@ def tool_incident_analyze(incident_id: int):
                 "error": str(e),
             },
         )
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=8088)

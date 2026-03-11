@@ -66,16 +66,6 @@ node_metadata:
     role: workstation
     subnet: 192.168.2.0/24
 
-  TheAnswer-PC:
-    host_type: windows
-    role: workstation
-    subnet: 192.168.2.0/24
-
-  THEANSWER-PC:
-    host_type: windows
-    role: workstation
-    subnet: 192.168.2.0/24
-
 service_metadata:
   nxlog-unraid:
     app_stack: monitoring

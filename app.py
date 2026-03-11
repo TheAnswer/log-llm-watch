@@ -54,10 +54,20 @@ _SUPPRESS_EC_HOST: set[tuple[str, str]] = set() # match_type='event_class_host'
 _SUPPRESS_REGEX: list[re.Pattern] = []          # match_type='message_regex'
 _SUPPRESS_LOCK = threading.Lock()
 
-# LLM-auto-noise cache — fingerprints the LLM has rated 'ignore', with expiry
-_NOISE_FP: set[str] = set()
-_NOISE_LOCK = threading.Lock()
-LLM_NOISE_TTL_DAYS = 3
+# Cooldown cache for ignore logging — avoid flooding the journal
+_IGNORE_LOG_SEEN: dict[str, float] = {}
+_IGNORE_LOG_LOCK = threading.Lock()
+_IGNORE_LOG_COOLDOWN_SECS = 60
+
+
+def _log_ignored(container: str, host: str, message: str, reason: str) -> None:
+    key = f"{container}|{host}|{message[:80]}"
+    now = time.monotonic()
+    with _IGNORE_LOG_LOCK:
+        if now - _IGNORE_LOG_SEEN.get(key, 0) < _IGNORE_LOG_COOLDOWN_SECS:
+            return
+        _IGNORE_LOG_SEEN[key] = now
+    print(f"[ignore] {reason} host={host!r} container={container!r} msg={message[:120]!r}", flush=True)
 
 
 def _load_suppressed_fingerprints() -> None:
@@ -94,42 +104,62 @@ def _load_suppressed_fingerprints() -> None:
         print(f"[suppress] Failed to load suppress rules: {e}", flush=True)
 
 
-def _load_noise_fingerprints() -> None:
-    """Reload the LLM noise cache from DB (non-expired entries only)."""
-    try:
-        now_iso = utcnow().isoformat()
-        with sqlite3.connect(DB_PATH) as conn:
-            rows = conn.execute(
-                "SELECT fingerprint FROM llm_noise_fingerprints WHERE suppressed_until > ?",
-                (now_iso,),
-            ).fetchall()
-        fp = {row[0] for row in rows}
-        with _NOISE_LOCK:
-            _NOISE_FP.clear()
-            _NOISE_FP.update(fp)
-    except Exception as e:
-        print(f"[noise_cache] Failed to load: {e}", flush=True)
+def template_to_suppress_pattern(template: str) -> str:
+    """Convert a normalize_message() template to a (?i) regex, same logic as the dashboard."""
+    parts = re.split(r"(<[^>]+>)", template)
+    result = []
+    for part in parts:
+        if re.match(r"^<[^>]+>$", part):
+            result.append(r"\S+")
+        else:
+            result.append(re.escape(part))
+    return "(?i)" + "".join(result)
 
 
-def _upsert_noise_fingerprints(fingerprints: list[str]) -> None:
-    """Mark fingerprints as LLM-noise with a TTL, then reload the cache."""
-    if not fingerprints:
+def _auto_suppress_ignored(groups_by_fp: dict[str, dict[str, Any]], ignored_fps: list[str]) -> None:
+    """Create message_regex suppress rules for groups the LLM rated as ignore."""
+    if not ignored_fps:
         return
-    now = utcnow()
-    suppressed_until = (now + timedelta(days=LLM_NOISE_TTL_DAYS)).isoformat()
-    now_iso = now.isoformat()
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.executemany(
-            """
-            INSERT INTO llm_noise_fingerprints (fingerprint, suppressed_until, created_at)
-            VALUES (?, ?, ?)
-            ON CONFLICT(fingerprint) DO UPDATE SET suppressed_until=excluded.suppressed_until
-            """,
-            [(fp, suppressed_until, now_iso) for fp in fingerprints],
-        )
-        conn.commit()
-    _load_noise_fingerprints()
-    print(f"[noise_cache] suppressed {len(fingerprints)} fingerprint(s) for {LLM_NOISE_TTL_DAYS}d", flush=True)
+    now_iso = utcnow().isoformat()
+    created = 0
+    for fp in ignored_fps:
+        g = groups_by_fp.get(fp)
+        if not g:
+            continue
+        template = g.get("message_template") or ""
+        if not template:
+            continue
+        pattern = template_to_suppress_pattern(template)
+        try:
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO suppress_rules
+                        (match_type, canonical_fingerprint, match_host, match_pattern,
+                         incident_title, event_class, reason, created_at)
+                    VALUES (?, ?, '', ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "message_regex",
+                        fp,
+                        pattern,
+                        g.get("container", ""),
+                        g.get("event_class", ""),
+                        "auto: llm-ignore",
+                        now_iso,
+                    ),
+                )
+                conn.commit()
+            created += 1
+            print(
+                f"[auto-suppress] message_regex for container={g.get('container')!r}"
+                f" pattern={pattern!r}",
+                flush=True,
+            )
+        except Exception as e:
+            print(f"[auto-suppress] failed to insert rule for fp={fp!r}: {e}", flush=True)
+    if created:
+        _load_suppressed_fingerprints()
 
 
 def _run_backfill() -> None:
@@ -159,7 +189,6 @@ def _check_ollama_health() -> None:
 async def lifespan(_app: FastAPI):
     init_db()
     _load_suppressed_fingerprints()
-    _load_noise_fingerprints()
     _check_ollama_health()
     threading.Thread(target=_run_backfill, daemon=True).start()
     threading.Thread(target=analysis_loop, daemon=True).start()
@@ -1105,6 +1134,7 @@ async def dozzle_webhook(request: Request):
     event = extract_dozzle_event(payload)
 
     if should_ignore(event["message"]):
+        _log_ignored(event["container"], event["host"], event["message"], "regex/suppress")
         return JSONResponse({"stored": False, "reason": "ignored"})
 
     fp = store_event(payload, event)
@@ -1128,6 +1158,7 @@ async def windows_webhook(request: Request):
     event = extract_windows_event(payload)
 
     if should_ignore(event["message"]):
+        _log_ignored(event["container"], event["host"], event["message"], "regex/suppress")
         return JSONResponse({"stored": False, "reason": "ignored"})
 
     fp = store_event(payload, event)
@@ -1151,6 +1182,7 @@ async def syslog_webhook(request: Request):
     event = extract_syslog_event(payload)
 
     if should_ignore(event["message"]):
+        _log_ignored(event["container"], event["host"], event["message"], "regex/suppress")
         return JSONResponse(
             {"stored": False, "reason": "ignored"},
             headers={"Connection": "close"},
@@ -1199,6 +1231,8 @@ def group_events(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
             "examples": [],
             "ids": [],
             "fingerprint": "",
+            "message_template": "",
+            "event_class": "",
         }
     )
 
@@ -1214,6 +1248,10 @@ def group_events(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
         g["level"] = row["level"]
         g["stream"] = row["stream"]
         g["fingerprint"] = row["fingerprint"]
+        if not g["message_template"] and row["message_template"]:
+            g["message_template"] = row["message_template"]
+        if not g["event_class"] and row["event_class"]:
+            g["event_class"] = row["event_class"]
         g["ids"].append(row["id"])
 
         created_at = row["created_at"]
@@ -1378,24 +1416,9 @@ def analyze_once() -> None:
         return
 
     all_ids = [row["id"] for row in rows]
-    all_groups = group_events(rows)
-
-    # Split groups: skip ones the LLM already rated as noise (still mark processed)
-    with _NOISE_LOCK:
-        noise_fp = set(_NOISE_FP)
-
-    live_groups = [g for g in all_groups if g["fingerprint"] not in noise_fp]
-    noise_ids = [id_ for g in all_groups if g["fingerprint"] in noise_fp for id_ in g["ids"]]
-
-    if noise_ids:
-        mark_processed(noise_ids)
-        print(f"[analyze_once] skipped {len(noise_ids)} event(s) across {len(all_groups) - len(live_groups)} noise group(s)", flush=True)
-
-    if not live_groups:
-        return
-
-    prompt = build_prompt(live_groups)
-    live_ids = [id_ for g in live_groups for id_ in g["ids"]]
+    groups = group_events(rows)
+    groups_by_fp = {g["fingerprint"]: g for g in groups}
+    prompt = build_prompt(groups)
 
     try:
         result, raw_response = call_ollama(prompt)
@@ -1403,24 +1426,23 @@ def analyze_once() -> None:
             prompt=prompt,
             raw_response=raw_response,
             parsed_result=result,
-            event_count=len(live_ids),
+            event_count=len(all_ids),
         )
     except Exception as e:
         store_analysis_run(
             prompt=prompt,
             raw_response=f"ERROR: {e}",
             parsed_result=None,
-            event_count=len(live_ids),
+            event_count=len(all_ids),
         )
         raise
 
     all_findings = result.get("findings", [])
     findings = [f for f in all_findings if f.get("severity") in {"low", "medium", "high"}]
 
-    # Auto-suppress fingerprints the LLM rated as ignore
+    # Auto-create message_regex suppress rules for groups the LLM rated as ignore
     ignored_fps = [f["fingerprint"] for f in all_findings if f.get("severity") == "ignore" and f.get("fingerprint")]
-    if ignored_fps:
-        _upsert_noise_fingerprints(ignored_fps)
+    _auto_suppress_ignored(groups_by_fp, ignored_fps)
 
     if findings:
         priority = "urgent" if any(f["severity"] == "high" for f in findings) else "default"
@@ -1434,7 +1456,7 @@ def analyze_once() -> None:
 
         send_ntfy("\n".join(lines).strip(), priority=priority)
 
-    mark_processed(live_ids)
+    mark_processed(all_ids)
 
 
 def analysis_loop() -> None:
@@ -1971,14 +1993,7 @@ def cleanup_old_data() -> None:
         cur.execute("DELETE FROM analysis_runs WHERE created_at < ?", (analysis_runs_cutoff,))
         deleted_analysis_runs = cur.rowcount
 
-        now_iso = utcnow().isoformat()
-        cur.execute("DELETE FROM llm_noise_fingerprints WHERE suppressed_until <= ?", (now_iso,))
-        deleted_noise = cur.rowcount
-
         conn.commit()
-
-    if deleted_noise:
-        _load_noise_fingerprints()
 
     print(
         "[cleanup] deleted "
@@ -1986,8 +2001,7 @@ def cleanup_old_data() -> None:
         f"daily_runs={deleted_daily} "
         f"weekly_runs={deleted_weekly} "
         f"housekeeping_runs={deleted_housekeeping} "
-        f"analysis_runs={deleted_analysis_runs} "
-        f"noise_cache={deleted_noise}",
+        f"analysis_runs={deleted_analysis_runs}",
         flush=True,
     )
 
@@ -3130,6 +3144,38 @@ def api_suppress_incident(
 
     _load_suppressed_fingerprints()
     return {"ok": True, "incident_id": incident_id, "scope": scope}
+
+
+@app.get("/api/events")
+def api_events(limit: int = 100, offset: int = 0, host: str = "", container: str = ""):
+    clauses = []
+    params: list[Any] = []
+    if host:
+        clauses.append("host = ?")
+        params.append(host)
+    if container:
+        clauses.append("container = ?")
+        params.append(container)
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    params += [limit, offset]
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            f"""
+            SELECT id, ts, created_at, host, container, stream, level, severity_norm,
+                   event_class, message, processed, fingerprint, incident_id
+            FROM events
+            {where}
+            ORDER BY id DESC
+            LIMIT ? OFFSET ?
+            """,
+            params,
+        ).fetchall()
+        total = conn.execute(
+            f"SELECT COUNT(*) FROM events {where}",
+            params[:-2],
+        ).fetchone()[0]
+    return {"items": [dict(r) for r in rows], "total": total}
 
 
 @app.get("/api/suppress-rules")

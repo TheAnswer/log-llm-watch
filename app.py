@@ -47,6 +47,47 @@ _OLLAMA_LOCK = threading.Lock()
 # Serialise incident SELECT+INSERT to prevent duplicate creation under concurrent ingest
 _INCIDENT_LOCK = threading.Lock()
 
+# In-memory suppression caches — all O(1) or O(n-patterns) lookup per event
+_SUPPRESS_FP: set[str] = set()                  # match_type='fingerprint'
+_SUPPRESS_EC: set[str] = set()                  # match_type='event_class'
+_SUPPRESS_EC_HOST: set[tuple[str, str]] = set() # match_type='event_class_host'
+_SUPPRESS_REGEX: list[re.Pattern] = []          # match_type='message_regex'
+_SUPPRESS_LOCK = threading.Lock()
+
+
+def _load_suppressed_fingerprints() -> None:
+    """Reload all in-memory suppression caches from the DB."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT match_type, canonical_fingerprint, event_class, match_host, match_pattern FROM suppress_rules"
+            ).fetchall()
+        fp: set[str] = set()
+        ec: set[str] = set()
+        ec_host: set[tuple[str, str]] = set()
+        regex: list[re.Pattern] = []
+        for row in rows:
+            mt = row["match_type"]
+            if mt == "fingerprint":
+                fp.add(row["canonical_fingerprint"])
+            elif mt == "event_class":
+                ec.add(row["event_class"])
+            elif mt == "event_class_host":
+                ec_host.add((row["event_class"], row["match_host"]))
+            elif mt == "message_regex":
+                try:
+                    regex.append(re.compile(row["match_pattern"]))
+                except re.error as e:
+                    print(f"[suppress] Invalid regex in rule: {row['match_pattern']!r}: {e}", flush=True)
+        with _SUPPRESS_LOCK:
+            _SUPPRESS_FP.clear(); _SUPPRESS_FP.update(fp)
+            _SUPPRESS_EC.clear(); _SUPPRESS_EC.update(ec)
+            _SUPPRESS_EC_HOST.clear(); _SUPPRESS_EC_HOST.update(ec_host)
+            _SUPPRESS_REGEX.clear(); _SUPPRESS_REGEX.extend(regex)
+    except Exception as e:
+        print(f"[suppress] Failed to load suppress rules: {e}", flush=True)
+
 
 def _run_backfill() -> None:
     try:
@@ -74,6 +115,7 @@ def _check_ollama_health() -> None:
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     init_db()
+    _load_suppressed_fingerprints()
     _check_ollama_health()
     threading.Thread(target=_run_backfill, daemon=True).start()
     threading.Thread(target=analysis_loop, daemon=True).start()
@@ -241,6 +283,24 @@ def init_db() -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_analysis_runs_created_at ON analysis_runs(created_at)"
         )
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS suppress_rules (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                match_type TEXT NOT NULL DEFAULT 'fingerprint',
+                canonical_fingerprint TEXT NOT NULL DEFAULT '',
+                match_host TEXT NOT NULL DEFAULT '',
+                incident_title TEXT NOT NULL DEFAULT '',
+                event_class TEXT NOT NULL DEFAULT '',
+                reason TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        add_column_if_missing("suppress_rules", "match_type", "TEXT NOT NULL DEFAULT 'fingerprint'")
+        add_column_if_missing("suppress_rules", "match_host", "TEXT NOT NULL DEFAULT ''")
+        add_column_if_missing("suppress_rules", "match_pattern", "TEXT NOT NULL DEFAULT ''")
         conn.commit()
 
 
@@ -462,7 +522,19 @@ def root_cause_candidates_for_event(event: dict[str, str]) -> list[str]:
     return mapping.get(event_class, [])
 
 
-def attach_or_create_incident(conn: sqlite3.Connection, event: dict[str, str]) -> int:
+def attach_or_create_incident(conn: sqlite3.Connection, event: dict[str, str]) -> int | None:
+    # Skip incident creation/update for suppressed events
+    _fp = event.get("canonical_fingerprint", "")
+    _ec = event.get("event_class", "")
+    _host = event.get("host", "")
+    with _SUPPRESS_LOCK:
+        if (
+            (_fp and _fp in _SUPPRESS_FP)
+            or (_ec and _ec in _SUPPRESS_EC)
+            or (_ec and _host and (_ec, _host) in _SUPPRESS_EC_HOST)
+        ):
+            return None
+
     now_iso = utcnow().isoformat()
     window_minutes = int(CONFIG.get("incidents", {}).get("open_window_minutes", 10))
     window_start = (utcnow() - timedelta(minutes=window_minutes)).isoformat()
@@ -596,7 +668,10 @@ def close_stale_incidents() -> None:
 
 
 def should_ignore(message: str) -> bool:
-    return any(p.search(message) for p in _IGNORE_PATTERNS)
+    if any(p.search(message) for p in _IGNORE_PATTERNS):
+        return True
+    with _SUPPRESS_LOCK:
+        return any(p.search(message) for p in _SUPPRESS_REGEX)
 
 
 def extract_dozzle_event(payload: Any) -> dict[str, str]:
@@ -2899,6 +2974,97 @@ def tool_incident_analyze(incident_id: int):
                 "error": str(e),
             },
         )
+
+
+@app.post("/api/incidents/{incident_id}/suppress")
+def api_suppress_incident(
+    incident_id: int,
+    scope: str = "fingerprint",
+    reason: str = "",
+    match_host: str = "",
+    match_pattern: str = "",
+):
+    allowed_scopes = {"fingerprint", "event_class", "event_class_host", "message_regex"}
+    if scope not in allowed_scopes:
+        raise HTTPException(status_code=400, detail=f"scope must be one of {allowed_scopes}")
+
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        incident = conn.execute(
+            "SELECT id, primary_fingerprint, title, event_class FROM incidents WHERE id = ?",
+            (incident_id,),
+        ).fetchone()
+        if not incident:
+            raise HTTPException(status_code=404, detail="Incident not found")
+
+        fingerprint = incident["primary_fingerprint"] or ""
+        event_class = incident["event_class"] or ""
+
+        if scope == "fingerprint" and not fingerprint:
+            raise HTTPException(status_code=400, detail="Incident has no canonical fingerprint")
+        if scope in ("event_class", "event_class_host") and not event_class:
+            raise HTTPException(status_code=400, detail="Incident has no event_class")
+        if scope == "event_class_host" and not match_host:
+            raise HTTPException(status_code=400, detail="match_host is required for event_class_host scope")
+        if scope == "message_regex":
+            if not match_pattern:
+                raise HTTPException(status_code=400, detail="match_pattern is required for message_regex scope")
+            try:
+                re.compile(match_pattern)
+            except re.error as e:
+                raise HTTPException(status_code=400, detail=f"Invalid regex: {e}")
+
+        host_val = match_host if scope == "event_class_host" else ""
+        pattern_val = match_pattern if scope == "message_regex" else ""
+
+        try:
+            conn.execute(
+                """
+                INSERT INTO suppress_rules
+                    (match_type, canonical_fingerprint, match_host, match_pattern,
+                     incident_title, event_class, reason, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (scope, fingerprint, host_val, pattern_val,
+                 incident["title"], event_class, reason, utcnow().isoformat()),
+            )
+        except sqlite3.IntegrityError:
+            pass  # already suppressed — idempotent
+
+        conn.execute(
+            "UPDATE incidents SET status = 'closed', updated_at = ? WHERE id = ?",
+            (utcnow().isoformat(), incident_id),
+        )
+        conn.commit()
+
+    _load_suppressed_fingerprints()
+    return {"ok": True, "incident_id": incident_id, "scope": scope}
+
+
+@app.get("/api/suppress-rules")
+def api_list_suppress_rules():
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT id, match_type, canonical_fingerprint, match_host, match_pattern,
+                   incident_title, event_class, reason, created_at
+            FROM suppress_rules ORDER BY created_at DESC
+            """
+        ).fetchall()
+    return {"items": [dict(row) for row in rows]}
+
+
+@app.delete("/api/suppress-rules/{rule_id}")
+def api_delete_suppress_rule(rule_id: int):
+    with sqlite3.connect(DB_PATH) as conn:
+        result = conn.execute("DELETE FROM suppress_rules WHERE id = ?", (rule_id,))
+        conn.commit()
+        if result.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Rule not found")
+
+    _load_suppressed_fingerprints()
+    return {"ok": True, "rule_id": rule_id}
 
 
 @app.post("/admin/reload-config")

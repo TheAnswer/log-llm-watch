@@ -11,7 +11,7 @@ ollama:
   timeout_seconds: 300
 
 analysis:
-  batch_window_minutes: 1
+  batch_window_minutes: 5
   max_examples_per_group: 5
   min_events_before_analysis: 1
   ignore_if_older_than_hours: 24

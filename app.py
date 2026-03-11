@@ -60,14 +60,14 @@ _IGNORE_LOG_LOCK = threading.Lock()
 _IGNORE_LOG_COOLDOWN_SECS = 60
 
 
-def _log_ignored(container: str, host: str, message: str, reason: str) -> None:
+def _log_ignored(container: str, host: str, message: str, reason: str, elapsed_ms: float = 0.0) -> None:
     key = f"{container}|{host}|{message[:80]}"
     now = time.monotonic()
     with _IGNORE_LOG_LOCK:
         if now - _IGNORE_LOG_SEEN.get(key, 0) < _IGNORE_LOG_COOLDOWN_SECS:
             return
         _IGNORE_LOG_SEEN[key] = now
-    print(f"[ignore] {reason} host={host!r} container={container!r} msg={message[:120]!r}", flush=True)
+    print(f"[ignore] {reason} host={host!r} container={container!r} elapsed={elapsed_ms:.1f}ms msg={message[:120]!r}", flush=True)
 
 
 def _load_suppressed_fingerprints() -> None:
@@ -204,6 +204,18 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    t0 = time.monotonic()
+    response = await call_next(request)
+    elapsed_ms = (time.monotonic() - t0) * 1000
+    print(
+        f"[http] {request.method} {request.url.path} -> {response.status_code} ({elapsed_ms:.1f}ms)",
+        flush=True,
+    )
+    return response
 
 def init_db() -> None:
     Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
@@ -1126,6 +1138,7 @@ def healthz():
 
 @app.post("/dozzle")
 async def dozzle_webhook(request: Request):
+    t0 = time.monotonic()
     try:
         payload = await request.json()
     except Exception:
@@ -1134,7 +1147,7 @@ async def dozzle_webhook(request: Request):
     event = extract_dozzle_event(payload)
 
     if should_ignore(event["message"]):
-        _log_ignored(event["container"], event["host"], event["message"], "regex/suppress")
+        _log_ignored(event["container"], event["host"], event["message"], "regex/suppress", (time.monotonic() - t0) * 1000)
         return JSONResponse({"stored": False, "reason": "ignored"})
 
     fp = store_event(payload, event)
@@ -1150,6 +1163,7 @@ async def dozzle_webhook(request: Request):
 
 @app.post("/windows")
 async def windows_webhook(request: Request):
+    t0 = time.monotonic()
     try:
         payload = await request.json()
     except Exception:
@@ -1158,7 +1172,7 @@ async def windows_webhook(request: Request):
     event = extract_windows_event(payload)
 
     if should_ignore(event["message"]):
-        _log_ignored(event["container"], event["host"], event["message"], "regex/suppress")
+        _log_ignored(event["container"], event["host"], event["message"], "regex/suppress", (time.monotonic() - t0) * 1000)
         return JSONResponse({"stored": False, "reason": "ignored"})
 
     fp = store_event(payload, event)
@@ -1174,6 +1188,7 @@ async def windows_webhook(request: Request):
 
 @app.post("/syslog")
 async def syslog_webhook(request: Request):
+    t0 = time.monotonic()
     try:
         payload = await request.json()
     except Exception:
@@ -1182,7 +1197,7 @@ async def syslog_webhook(request: Request):
     event = extract_syslog_event(payload)
 
     if should_ignore(event["message"]):
-        _log_ignored(event["container"], event["host"], event["message"], "regex/suppress")
+        _log_ignored(event["container"], event["host"], event["message"], "regex/suppress", (time.monotonic() - t0) * 1000)
         return JSONResponse(
             {"stored": False, "reason": "ignored"},
             headers={"Connection": "close"},
@@ -2385,6 +2400,7 @@ Return strict JSON only with this schema:
   "summary": "string",
   "probable_root_cause": "string",
   "confidence": "low|medium|high",
+  "is_false_positive": true|false,
   "evidence": ["string"],
   "next_checks": ["string"]
 }}
@@ -2392,7 +2408,9 @@ Return strict JSON only with this schema:
 Guidance:
 - "summary" should be 1-3 sentences
 - "probable_root_cause" should be a short machine-friendly label like:
-  "service_unavailable", "routing_or_firewall_issue", "dns_failure", "storage_backpressure", "unknown"
+  "service_unavailable", "routing_or_firewall_issue", "dns_failure", "storage_backpressure", "unknown",
+  "false_positive" (use this when the incident is noise, benign, or was incorrectly escalated)
+- "is_false_positive" must be true only when the incident is clearly noise, benign, or a misclassification — set false for any genuinely actionable issue regardless of severity
 - "confidence" should reflect how directly the evidence supports the conclusion
 - "evidence" should include 2-5 concise points grounded in the input
 - "next_checks" should include 2-5 concrete operational checks
@@ -2416,6 +2434,7 @@ def analyze_incident_with_ollama(
         "summary": str(result.get("summary") or "").strip(),
         "probable_root_cause": str(result.get("probable_root_cause") or "unknown").strip(),
         "confidence": str(result.get("confidence") or "low").strip().lower(),
+        "is_false_positive": bool(result.get("is_false_positive", False)),
         "evidence": result.get("evidence") if isinstance(result.get("evidence"), list) else [],
         "next_checks": result.get("next_checks") if isinstance(result.get("next_checks"), list) else [],
     }
@@ -2832,24 +2851,32 @@ def api_analyze_incident(
         )
 
 
+_DIGEST_CACHE: dict[str, Any] = {}
+_DIGEST_CACHE_TTL_SECS = 300  # 5 minutes
+_DIGEST_CACHE_LOCK = threading.Lock()
+
+
 @app.get("/api/incidents/open/llm-digest")
 def api_open_incidents_llm_digest(
     limit: int = 10,
     include_raw_response: bool = False,
+    refresh: bool = False,
 ):
+    with _DIGEST_CACHE_LOCK:
+        cached = _DIGEST_CACHE.get("result")
+        cached_at = _DIGEST_CACHE.get("cached_at", 0.0)
+        age = time.monotonic() - cached_at
+        if cached is not None and not refresh and age < _DIGEST_CACHE_TTL_SECS:
+            return cached
+
     try:
-        return generate_open_incidents_digest(
-            limit=limit,
-            include_raw_response=include_raw_response,
-        )
+        result = generate_open_incidents_digest(limit=limit, include_raw_response=include_raw_response)
+        with _DIGEST_CACHE_LOCK:
+            _DIGEST_CACHE["result"] = result
+            _DIGEST_CACHE["cached_at"] = time.monotonic()
+        return result
     except Exception as e:
-        return JSONResponse(
-            status_code=500,
-            content={
-                "ok": False,
-                "error": str(e),
-            },
-        )
+        return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
 
 
 @app.get("/api/events")
@@ -2931,6 +2958,66 @@ def admin_backfill_events(limit: int = 1000):
     except Exception as e:
         return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
 
+_FALSE_POSITIVE_LABELS = {"false_positive", "false_positive_severity", "false_positive_noise"}
+
+
+def _auto_close_false_positive(incident_id: int, confidence: str) -> None:
+    """Close a false-positive incident and create a message_regex suppress rule."""
+    now_iso = utcnow().isoformat()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        incident = conn.execute(
+            "SELECT id, title, event_class, primary_fingerprint FROM incidents WHERE id = ?",
+            (incident_id,),
+        ).fetchone()
+        if not incident:
+            return
+
+        # Derive a message_regex from the most common message_template for this incident
+        row = conn.execute(
+            """
+            SELECT message_template FROM events
+            WHERE incident_id = ? AND message_template != ''
+            GROUP BY message_template ORDER BY COUNT(*) DESC LIMIT 1
+            """,
+            (incident_id,),
+        ).fetchone()
+        pattern = template_to_suppress_pattern(row["message_template"]) if row else ""
+
+        conn.execute(
+            "UPDATE incidents SET status = 'closed', updated_at = ? WHERE id = ?",
+            (now_iso, incident_id),
+        )
+        if pattern:
+            try:
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO suppress_rules
+                        (match_type, canonical_fingerprint, match_host, match_pattern,
+                         incident_title, event_class, reason, created_at)
+                    VALUES ('message_regex', ?, '', ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        incident["primary_fingerprint"] or "",
+                        pattern,
+                        incident["title"] or "",
+                        incident["event_class"] or "",
+                        f"auto: false_positive (confidence={confidence})",
+                        now_iso,
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                pass
+        conn.commit()
+
+    _load_suppressed_fingerprints()
+    print(
+        f"[auto-close] incident #{incident_id} closed as false_positive"
+        + (f", suppress rule created: {pattern!r}" if pattern else ""),
+        flush=True,
+    )
+
+
 def analyze_missing_incidents(
     limit: int = 10,
     include_closed: bool = False,
@@ -2984,6 +3071,16 @@ def analyze_missing_incidents(
                 persist_summary=True,
                 include_raw_response=False,
             )
+            root_cause = result["analysis"]["probable_root_cause"]
+            confidence = result["analysis"]["confidence"]
+            is_fp = result["analysis"].get("is_false_positive", False)
+
+            if is_fp and root_cause in _FALSE_POSITIVE_LABELS and confidence in ("medium", "high"):
+                try:
+                    _auto_close_false_positive(incident_id, confidence)
+                except Exception as e:
+                    print(f"[auto-close] error for incident #{incident_id}: {e}", flush=True)
+
             processed.append(
                 {
                     "incident_id": incident_id,
@@ -2991,8 +3088,8 @@ def analyze_missing_incidents(
                     "severity": row["severity"],
                     "event_class": row["event_class"],
                     "title": row["title"],
-                    "probable_root_cause": result["analysis"]["probable_root_cause"],
-                    "confidence": result["analysis"]["confidence"],
+                    "probable_root_cause": root_cause,
+                    "confidence": confidence,
                 }
             )
         except Exception as e:

@@ -59,9 +59,22 @@ def _run_backfill() -> None:
         print(f"[startup] backfill error: {e}", flush=True)
 
 
+def _check_ollama_health() -> None:
+    ollama_url = CONFIG["ollama"]["url"]
+    try:
+        resp = requests.get(f"{ollama_url}/api/tags", timeout=5)
+        if resp.status_code == 200:
+            print(f"[startup] Ollama OK at {ollama_url}", flush=True)
+        else:
+            print(f"[startup] WARNING: Ollama at {ollama_url} returned HTTP {resp.status_code}", flush=True)
+    except Exception as e:
+        print(f"[startup] WARNING: Ollama unreachable at {ollama_url}: {e}", flush=True)
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     init_db()
+    _check_ollama_health()
     threading.Thread(target=_run_backfill, daemon=True).start()
     threading.Thread(target=analysis_loop, daemon=True).start()
     yield
@@ -2418,33 +2431,34 @@ def generate_open_incidents_digest(limit: int = 10, include_raw_response: bool =
 
 
 @app.get("/api/incidents")
-def api_incidents(status: str = "open", limit: int = 20):
+def api_incidents(status: str = "open", limit: int = 20, severity: str = "", offset: int = 0):
     limit = max(1, min(limit, 200))
+    offset = max(0, offset)
+
+    conditions: list[str] = []
+    params: list[Any] = []
+
+    if status != "all":
+        conditions.append("status = ?")
+        params.append(status)
+
+    if severity:
+        conditions.append("severity = ?")
+        params.append(severity)
+
+    where_clause = ("WHERE " + " AND ".join(conditions)) if conditions else ""
 
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
 
-        if status == "all":
-            rows = conn.execute(
-                """
-                SELECT *
-                FROM incidents
-                ORDER BY last_seen DESC
-                LIMIT ?
-                """,
-                (limit,),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                """
-                SELECT *
-                FROM incidents
-                WHERE status = ?
-                ORDER BY last_seen DESC
-                LIMIT ?
-                """,
-                (status, limit),
-            ).fetchall()
+        total: int = conn.execute(
+            f"SELECT COUNT(*) FROM incidents {where_clause}", params
+        ).fetchone()[0]
+
+        rows = conn.execute(
+            f"SELECT * FROM incidents {where_clause} ORDER BY last_seen DESC LIMIT ? OFFSET ?",
+            params + [limit, offset],
+        ).fetchall()
 
     items = []
     for row in rows:
@@ -2470,7 +2484,7 @@ def api_incidents(status: str = "open", limit: int = 20):
             }
         )
 
-    return {"items": items}
+    return {"items": items, "total": total, "offset": offset, "limit": limit}
 
 
 @app.patch("/api/incidents/{incident_id}")
@@ -2885,6 +2899,17 @@ def tool_incident_analyze(incident_id: int):
                 "error": str(e),
             },
         )
+
+
+@app.post("/admin/reload-config")
+def admin_reload_config():
+    global CONFIG, NODE_METADATA, SERVICE_METADATA, _IGNORE_PATTERNS
+    CONFIG = load_config()
+    NODE_METADATA = CONFIG.get("node_metadata", {})
+    SERVICE_METADATA = CONFIG.get("service_metadata", {})
+    _IGNORE_PATTERNS = [re.compile(p) for p in CONFIG["filters"]["ignore_message_regex"]]
+    print("[admin] Config reloaded", flush=True)
+    return {"ok": True, "message": "Config reloaded"}
 
 
 if __name__ == "__main__":

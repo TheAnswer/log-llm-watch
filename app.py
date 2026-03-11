@@ -110,8 +110,8 @@ def template_to_suppress_pattern(template: str) -> str:
     result = []
     for part in parts:
         if re.match(r"^<[^>]+>$", part):
-            # Allow one optional space inside token — handles timestamps like "2026-03-11 17:21:36"
-            result.append(r"\S+(?:[ ]\S+)?")
+            # Lazy match — surrounding literals act as terminators, handles space-containing tokens
+            result.append(r".+?")
         else:
             result.append(re.escape(part))
     return "(?i)" + "".join(result)
@@ -416,6 +416,7 @@ def current_system_time_str() -> str:
 
 def normalize_message(msg: str) -> str:
     msg = re.sub(r"\b\d{4}-\d{2}-\d{2}[T ][0-9:\.\+\-Z]+\b", "<ts>", msg)
+    msg = re.sub(r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\b", "<month>", msg)
     msg = re.sub(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", "<ip>", msg)
     msg = re.sub(r":\d{2,5}\b", ":<port>", msg)
     msg = re.sub(r"\b[0-9a-f]{8}-[0-9a-f-]{27,}\b", "<uuid>", msg, flags=re.IGNORECASE)

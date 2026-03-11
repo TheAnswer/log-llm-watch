@@ -102,3 +102,7 @@ filters:
     - '(?i)\bmonitor_nchan: Stop running nchan processes\b'
     - '(?i)\bautofan: Highest disk temp is\b'
     - '(?i)\bupsd\[\d+\]: User .* logged into UPS \[ups\]\b'
+    - '(?i)\bpam_unix\(cron:session\): session (opened|closed) for user'
+    - '(?i)\bCRON\b.*\bcommand -v debian-sa1\b'
+    - '(?i)\bomv-mkrrdgraph\b'
+    - '(?i)\btailscaled\b.*\bhealth\(warnable=no-derp-connection\)\b'

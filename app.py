@@ -1223,6 +1223,7 @@ def call_ollama(prompt: str) -> tuple[dict[str, Any], str]:
         "format": "json",
         "options": {
             "temperature": 0.1,
+            "num_ctx": 32768,
         },
     }
 
@@ -1230,6 +1231,9 @@ def call_ollama(prompt: str) -> tuple[dict[str, Any], str]:
         r = requests.post(url, json=body, timeout=CONFIG["ollama"]["timeout_seconds"])
     r.raise_for_status()
     data = r.json()
+
+    if data.get("done_reason") == "length":
+        raise ValueError("Ollama response truncated (hit context limit). Consider reducing prompt size or increasing num_ctx.")
 
     raw_response = (data.get("response") or "").strip()
     raw_thinking = (data.get("thinking") or "").strip()
@@ -1259,7 +1263,10 @@ def call_ollama(prompt: str) -> tuple[dict[str, Any], str]:
     end = cleaned.rfind("}")
     if start != -1 and end != -1 and end > start:
         extracted = cleaned[start:end + 1]
-        return json.loads(extracted), candidate
+        try:
+            return json.loads(extracted), candidate
+        except json.JSONDecodeError:
+            pass
 
     raise ValueError(f"Could not parse Ollama JSON response. Candidate: {candidate!r}")
 

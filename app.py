@@ -419,6 +419,19 @@ def init_db() -> None:
 
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS ntfy_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sent_at TEXT NOT NULL,
+                title TEXT NOT NULL DEFAULT '',
+                priority TEXT NOT NULL DEFAULT 'default',
+                source TEXT NOT NULL DEFAULT '',
+                message TEXT NOT NULL DEFAULT ''
+            )
+            """
+        )
+
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS suppress_rules (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 match_type TEXT NOT NULL DEFAULT 'fingerprint',
@@ -1437,16 +1450,26 @@ def call_ollama_text(prompt: str) -> str:
     return text
 
 
-def send_ntfy(message: str, priority: str = "default") -> None:
+def send_ntfy(message: str, priority: str = "default", source: str = "analysis") -> None:
     url = CONFIG["notify"]["ntfy_url"]
+    title = CONFIG["notify"]["title"]
     headers = {
-        "Title": CONFIG["notify"]["title"],
+        "Title": title,
         "Priority": priority,
         "Tags": "warning,robot_face",
     }
     r = requests.post(url, data=message.encode("utf-8"), headers=headers, timeout=30)
     if not r.ok:
         raise RuntimeError(f"ntfy error {r.status_code}: {r.text}")
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                "INSERT INTO ntfy_log (sent_at, title, priority, source, message) VALUES (?, ?, ?, ?, ?)",
+                (utcnow().isoformat(), title, priority, source, message[:4000]),
+            )
+            conn.commit()
+    except Exception as e:
+        print(f"[ntfy] Failed to log notification: {e}", flush=True)
 
 
 def mark_processed(ids: list[int]) -> None:
@@ -1731,7 +1754,7 @@ def send_daily_report() -> None:
             "Overall Status: Healthy\n\n"
             "No alert-level events were recorded in the last 24 hours."
         )
-        send_ntfy(message, priority="default")
+        send_ntfy(message, priority="default", source="daily_report")
         print("[daily_report] sent healthy empty report", flush=True)
         return
 
@@ -1760,7 +1783,7 @@ def send_daily_report() -> None:
     elif "Overall Status: Warning" in message:
         priority = "high"
 
-    send_ntfy(message, priority=priority)
+    send_ntfy(message, priority=priority, source="daily_report")
     print("[daily_report] sent daily report", flush=True)
 
 
@@ -1948,7 +1971,7 @@ def send_weekly_report() -> None:
             "Overall Status: Healthy\n\n"
             "No alert-level events were recorded in the last 7 days."
         )
-        send_ntfy(message, priority="default")
+        send_ntfy(message, priority="default", source="weekly_report")
         print("[weekly_report] sent empty healthy report", flush=True)
         return
 
@@ -1974,7 +1997,7 @@ def send_weekly_report() -> None:
     message = truncate_for_ntfy(message, max_chars=3500)
 
     priority = "urgent" if "Overall Status: Critical" in message else "default"
-    send_ntfy(message, priority=priority)
+    send_ntfy(message, priority=priority, source="weekly_report")
 
     print("[weekly_report] sent weekly report", flush=True)
 
@@ -3344,6 +3367,18 @@ def api_delete_suppress_rule(rule_id: int):
 
     _load_suppressed_fingerprints()
     return {"ok": True, "rule_id": rule_id}
+
+
+@app.get("/api/ntfy-log")
+def api_ntfy_log(limit: int = 50):
+    limit = max(1, min(limit, 200))
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT id, sent_at, title, priority, source, message FROM ntfy_log ORDER BY id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return {"items": [dict(row) for row in rows]}
 
 
 @app.post("/admin/reload-config")

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import asyncio
 import hashlib
 import json
 import re
@@ -6,8 +7,10 @@ import sqlite3
 import threading
 import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timedelta, timezone
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +19,9 @@ import yaml
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+
+# Thread pool for offloading blocking DB/lock work from the async event loop
+_THREAD_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="db")
 
 BASE_DIR = Path("/opt/dozzle-llm-watch")
 CONFIG_PATH = BASE_DIR / "config.yaml"
@@ -104,14 +110,35 @@ def _load_suppressed_fingerprints() -> None:
         print(f"[suppress] Failed to load suppress rules: {e}", flush=True)
 
 
+def extract_inner_message(raw: str) -> str:
+    """If raw looks like an nxlog JSON wrapper, extract just the inner 'message' field value.
+    Works on both raw messages (valid JSON) and templates (with <placeholder> tokens)."""
+    trimmed = raw.strip()
+    if not trimmed.startswith("{"):
+        return trimmed
+    # Try JSON parse first (works on raw messages)
+    try:
+        parsed = json.loads(trimmed)
+        if isinstance(parsed.get("message"), str) and parsed["message"]:
+            return parsed["message"]
+    except Exception:
+        pass
+    # Fall back to regex extraction (works on templates with <placeholder> tokens)
+    m = re.search(r'"message":"([\s\S]+?)","(?:source|host|container|stream|level)"', trimmed)
+    if m:
+        return m.group(1)
+    return trimmed
+
+
 def template_to_suppress_pattern(template: str) -> str:
-    """Convert a normalize_message() template to a (?i) regex, same logic as the dashboard."""
-    parts = re.split(r"(<[^>]+>)", template)
+    """Convert a normalize_message() template to a (?i) regex, same logic as the dashboard.
+    Extracts inner message content from nxlog JSON wrappers first for simpler patterns."""
+    content = extract_inner_message(template)
+    parts = re.split(r"(<[^>]+>)", content)
     result = []
     for part in parts:
         if re.match(r"^<[^>]+>$", part):
-            # Lazy match — surrounding literals act as terminators, handles space-containing tokens
-            result.append(r".+?")
+            result.append(r"\S+")
         else:
             result.append(re.escape(part))
     return "(?i)" + "".join(result)
@@ -767,8 +794,11 @@ def close_stale_incidents() -> None:
 def should_ignore(message: str) -> bool:
     if any(p.search(message) for p in _IGNORE_PATTERNS):
         return True
+    # Normalize whitespace before testing suppress patterns —
+    # normalize_message() collapses multi-space but raw messages may have extra whitespace.
+    normalized = re.sub(r"\s+", " ", message)
     with _SUPPRESS_LOCK:
-        return any(p.search(message) for p in _SUPPRESS_REGEX)
+        return any(p.search(normalized) for p in _SUPPRESS_REGEX)
 
 
 def extract_dozzle_event(payload: Any) -> dict[str, str]:
@@ -1138,84 +1168,60 @@ def healthz():
     return {"ok": True}
 
 
+def _ingest_event(payload: Any, event: dict[str, str]) -> dict[str, Any]:
+    """Run all blocking work (ignore check, DB write) off the async event loop."""
+    t0 = time.monotonic()
+    if should_ignore(event["message"]):
+        _log_ignored(event["container"], event["host"], event["message"],
+                     "regex/suppress", (time.monotonic() - t0) * 1000)
+        return {"stored": False, "reason": "ignored"}
+
+    fp = store_event(payload, event)
+    return {
+        "stored": True,
+        "source": event["source"],
+        "container": event["container"],
+        "fingerprint": fp,
+    }
+
+
 @app.post("/dozzle")
 async def dozzle_webhook(request: Request):
-    t0 = time.monotonic()
     try:
         payload = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail="Expected JSON body")
 
     event = extract_dozzle_event(payload)
-
-    if should_ignore(event["message"]):
-        _log_ignored(event["container"], event["host"], event["message"], "regex/suppress", (time.monotonic() - t0) * 1000)
-        return JSONResponse({"stored": False, "reason": "ignored"})
-
-    fp = store_event(payload, event)
-    return JSONResponse(
-        {
-            "stored": True,
-            "source": event["source"],
-            "container": event["container"],
-            "fingerprint": fp,
-        }
-    )
+    loop = asyncio.get_running_loop()
+    result = await loop.run_in_executor(_THREAD_POOL, partial(_ingest_event, payload, event))
+    return JSONResponse(result)
 
 
 @app.post("/windows")
 async def windows_webhook(request: Request):
-    t0 = time.monotonic()
     try:
         payload = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail="Expected JSON body")
 
     event = extract_windows_event(payload)
-
-    if should_ignore(event["message"]):
-        _log_ignored(event["container"], event["host"], event["message"], "regex/suppress", (time.monotonic() - t0) * 1000)
-        return JSONResponse({"stored": False, "reason": "ignored"})
-
-    fp = store_event(payload, event)
-    return JSONResponse(
-        {
-            "stored": True,
-            "source": event["source"],
-            "container": event["container"],
-            "fingerprint": fp,
-        }
-    )
+    loop = asyncio.get_running_loop()
+    result = await loop.run_in_executor(_THREAD_POOL, partial(_ingest_event, payload, event))
+    return JSONResponse(result)
 
 
 @app.post("/syslog")
 async def syslog_webhook(request: Request):
-    t0 = time.monotonic()
     try:
         payload = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail="Expected JSON body")
 
     event = extract_syslog_event(payload)
-
-    if should_ignore(event["message"]):
-        _log_ignored(event["container"], event["host"], event["message"], "regex/suppress", (time.monotonic() - t0) * 1000)
-        return JSONResponse(
-            {"stored": False, "reason": "ignored"},
-            headers={"Connection": "close"},
-        )
-
-    fp = store_event(payload, event)
-
-    return JSONResponse(
-        {
-            "stored": True,
-            "source": event["source"],
-            "container": event["container"],
-            "fingerprint": fp,
-        },
-        headers={"Connection": "close"},
-    )
+    loop = asyncio.get_running_loop()
+    result = await loop.run_in_executor(_THREAD_POOL, partial(_ingest_event, payload, event))
+    return JSONResponse(result, headers={"Connection": "close"})
 
 
 def fetch_unprocessed_events() -> list[sqlite3.Row]:

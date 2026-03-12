@@ -50,6 +50,15 @@ _IGNORE_PATTERNS: list[re.Pattern] = [
 # Serialise all Ollama calls — prevents concurrent requests to the local model
 _OLLAMA_LOCK = threading.Lock()
 
+# LLM call statistics — protected by _OLLAMA_LOCK (only mutated inside call_ollama*)
+_LLM_STATS: dict[str, float | int] = {
+    "total_calls": 0,
+    "total_errors": 0,
+    "total_seconds": 0.0,
+    "last_call_at": "",
+    "last_duration_seconds": 0.0,
+}
+
 # Serialise incident SELECT+INSERT to prevent duplicate creation under concurrent ingest
 _INCIDENT_LOCK = threading.Lock()
 
@@ -428,6 +437,20 @@ def init_db() -> None:
                 message TEXT NOT NULL DEFAULT ''
             )
             """
+        )
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS llm_call_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                called_at TEXT NOT NULL,
+                duration_seconds REAL NOT NULL,
+                error INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_llm_call_log_called_at ON llm_call_log(called_at)"
         )
 
         conn.execute(
@@ -1367,6 +1390,25 @@ Input:
 """.strip()
 
 
+def _record_llm_call(duration: float, error: bool = False) -> None:
+    """Update in-memory LLM stats and persist to DB."""
+    _LLM_STATS["total_calls"] += 1
+    if error:
+        _LLM_STATS["total_errors"] += 1
+    _LLM_STATS["total_seconds"] += duration
+    _LLM_STATS["last_call_at"] = utcnow().isoformat()
+    _LLM_STATS["last_duration_seconds"] = duration
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                "INSERT INTO llm_call_log (called_at, duration_seconds, error) VALUES (?, ?, ?)",
+                (utcnow().isoformat(), round(duration, 3), 1 if error else 0),
+            )
+            conn.commit()
+    except Exception as e:
+        print(f"[llm_stats] Failed to log call: {e}", flush=True)
+
+
 def call_ollama(prompt: str) -> tuple[dict[str, Any], str]:
     url = CONFIG["ollama"]["url"].rstrip("/") + "/api/generate"
     body = {
@@ -1380,48 +1422,59 @@ def call_ollama(prompt: str) -> tuple[dict[str, Any], str]:
         },
     }
 
-    with _OLLAMA_LOCK:
-        r = requests.post(url, json=body, timeout=CONFIG["ollama"]["timeout_seconds"])
-    r.raise_for_status()
-    data = r.json()
-
-    if data.get("done_reason") == "length":
-        raise ValueError("Ollama response truncated (hit context limit). Consider reducing prompt size or increasing num_ctx.")
-
-    raw_response = (data.get("response") or "").strip()
-    raw_thinking = (data.get("thinking") or "").strip()
-
-    candidate = raw_response or raw_thinking
-
-    if not candidate:
-        raise ValueError(f"Ollama returned empty response and empty thinking. Full payload: {data!r}")
-
-    cleaned = candidate
-
+    t0 = time.monotonic()
     try:
-        return json.loads(cleaned), cleaned
-    except json.JSONDecodeError:
-        pass
+        with _OLLAMA_LOCK:
+            r = requests.post(url, json=body, timeout=CONFIG["ollama"]["timeout_seconds"])
+        r.raise_for_status()
+        data = r.json()
 
-    if cleaned.startswith("```"):
-        cleaned = re.sub(r"^```[a-zA-Z0-9_-]*\n?", "", cleaned)
-        cleaned = re.sub(r"\n?```$", "", cleaned).strip()
+        if data.get("done_reason") == "length":
+            raise ValueError("Ollama response truncated (hit context limit). Consider reducing prompt size or increasing num_ctx.")
 
-    try:
-        return json.loads(cleaned), candidate
-    except json.JSONDecodeError:
-        pass
+        raw_response = (data.get("response") or "").strip()
+        raw_thinking = (data.get("thinking") or "").strip()
 
-    start = cleaned.find("{")
-    end = cleaned.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        extracted = cleaned[start:end + 1]
+        candidate = raw_response or raw_thinking
+
+        if not candidate:
+            raise ValueError(f"Ollama returned empty response and empty thinking. Full payload: {data!r}")
+
+        cleaned = candidate
+
         try:
-            return json.loads(extracted), candidate
+            result = json.loads(cleaned), cleaned
+            _record_llm_call(time.monotonic() - t0)
+            return result
         except json.JSONDecodeError:
             pass
 
-    raise ValueError(f"Could not parse Ollama JSON response. Candidate: {candidate!r}")
+        if cleaned.startswith("```"):
+            cleaned = re.sub(r"^```[a-zA-Z0-9_-]*\n?", "", cleaned)
+            cleaned = re.sub(r"\n?```$", "", cleaned).strip()
+
+        try:
+            result = json.loads(cleaned), candidate
+            _record_llm_call(time.monotonic() - t0)
+            return result
+        except json.JSONDecodeError:
+            pass
+
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            extracted = cleaned[start:end + 1]
+            try:
+                result = json.loads(extracted), candidate
+                _record_llm_call(time.monotonic() - t0)
+                return result
+            except json.JSONDecodeError:
+                pass
+
+        raise ValueError(f"Could not parse Ollama JSON response. Candidate: {candidate!r}")
+    except Exception:
+        _record_llm_call(time.monotonic() - t0, error=True)
+        raise
 
 
 def call_ollama_text(prompt: str) -> str:
@@ -1435,19 +1488,25 @@ def call_ollama_text(prompt: str) -> str:
         },
     }
 
-    with _OLLAMA_LOCK:
-        r = requests.post(url, json=body, timeout=CONFIG["ollama"]["timeout_seconds"])
-    r.raise_for_status()
-    data = r.json()
+    t0 = time.monotonic()
+    try:
+        with _OLLAMA_LOCK:
+            r = requests.post(url, json=body, timeout=CONFIG["ollama"]["timeout_seconds"])
+        r.raise_for_status()
+        data = r.json()
 
-    raw_response = (data.get("response") or "").strip()
-    raw_thinking = (data.get("thinking") or "").strip()
+        raw_response = (data.get("response") or "").strip()
+        raw_thinking = (data.get("thinking") or "").strip()
 
-    text = raw_response or raw_thinking
-    if not text:
-        raise ValueError(f"Ollama returned empty response and empty thinking. Full payload: {data!r}")
+        text = raw_response or raw_thinking
+        if not text:
+            raise ValueError(f"Ollama returned empty response and empty thinking. Full payload: {data!r}")
 
-    return text
+        _record_llm_call(time.monotonic() - t0)
+        return text
+    except Exception:
+        _record_llm_call(time.monotonic() - t0, error=True)
+        raise
 
 
 def send_ntfy(message: str, priority: str = "default", source: str = "analysis") -> None:
@@ -2069,6 +2128,9 @@ def cleanup_old_data() -> None:
         cur.execute("DELETE FROM analysis_runs WHERE created_at < ?", (analysis_runs_cutoff,))
         deleted_analysis_runs = cur.rowcount
 
+        cur.execute("DELETE FROM llm_call_log WHERE called_at < ?", (analysis_runs_cutoff,))
+        deleted_llm_calls = cur.rowcount
+
         conn.commit()
 
     print(
@@ -2077,7 +2139,8 @@ def cleanup_old_data() -> None:
         f"daily_runs={deleted_daily} "
         f"weekly_runs={deleted_weekly} "
         f"housekeeping_runs={deleted_housekeeping} "
-        f"analysis_runs={deleted_analysis_runs}",
+        f"analysis_runs={deleted_analysis_runs} "
+        f"llm_calls={deleted_llm_calls}",
         flush=True,
     )
 
@@ -3379,6 +3442,59 @@ def api_ntfy_log(limit: int = 50):
             (limit,),
         ).fetchall()
     return {"items": [dict(row) for row in rows]}
+
+
+@app.get("/api/llm-stats")
+def api_llm_stats(days: int = 7):
+    days = max(1, min(days, 90))
+    cutoff = (utcnow() - timedelta(days=days)).isoformat()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        # Aggregates
+        row = conn.execute(
+            """
+            SELECT COUNT(*) AS total_calls,
+                   SUM(CASE WHEN error = 1 THEN 1 ELSE 0 END) AS total_errors,
+                   COALESCE(SUM(duration_seconds), 0) AS total_seconds,
+                   COALESCE(AVG(duration_seconds), 0) AS avg_seconds,
+                   COALESCE(MIN(duration_seconds), 0) AS min_seconds,
+                   COALESCE(MAX(duration_seconds), 0) AS max_seconds
+            FROM llm_call_log WHERE called_at >= ?
+            """,
+            (cutoff,),
+        ).fetchone()
+        # Per-day breakdown
+        daily = conn.execute(
+            """
+            SELECT DATE(called_at) AS day,
+                   COUNT(*) AS calls,
+                   SUM(CASE WHEN error = 1 THEN 1 ELSE 0 END) AS errors,
+                   ROUND(SUM(duration_seconds), 1) AS total_sec,
+                   ROUND(AVG(duration_seconds), 1) AS avg_sec
+            FROM llm_call_log WHERE called_at >= ?
+            GROUP BY DATE(called_at) ORDER BY day
+            """,
+            (cutoff,),
+        ).fetchall()
+        # Recent calls
+        recent = conn.execute(
+            """
+            SELECT called_at, duration_seconds, error
+            FROM llm_call_log ORDER BY id DESC LIMIT 20
+            """,
+        ).fetchall()
+    return {
+        "period_days": days,
+        "total_calls": row["total_calls"],
+        "total_errors": row["total_errors"],
+        "total_seconds": round(row["total_seconds"], 1),
+        "avg_seconds": round(row["avg_seconds"], 1),
+        "min_seconds": round(row["min_seconds"], 1),
+        "max_seconds": round(row["max_seconds"], 1),
+        "daily": [dict(d) for d in daily],
+        "recent": [dict(r) for r in recent],
+        "session": dict(_LLM_STATS),
+    }
 
 
 @app.post("/admin/reload-config")

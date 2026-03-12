@@ -57,7 +57,8 @@ _INCIDENT_LOCK = threading.Lock()
 _SUPPRESS_FP: set[str] = set()                  # match_type='fingerprint'
 _SUPPRESS_EC: set[str] = set()                  # match_type='event_class'
 _SUPPRESS_EC_HOST: set[tuple[str, str]] = set() # match_type='event_class_host'
-_SUPPRESS_REGEX: list[re.Pattern] = []          # match_type='message_regex'
+_SUPPRESS_REGEX: list[tuple[int, re.Pattern]] = []  # (rule_id, compiled pattern)
+_SUPPRESS_HITS: dict[int, int] = {}               # rule_id → in-memory hit count delta
 _SUPPRESS_LOCK = threading.Lock()
 
 # Cooldown cache for ignore logging — avoid flooding the journal
@@ -82,12 +83,12 @@ def _load_suppressed_fingerprints() -> None:
         with sqlite3.connect(DB_PATH) as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
-                "SELECT match_type, canonical_fingerprint, event_class, match_host, match_pattern FROM suppress_rules"
+                "SELECT id, match_type, canonical_fingerprint, event_class, match_host, match_pattern FROM suppress_rules"
             ).fetchall()
         fp: set[str] = set()
         ec: set[str] = set()
         ec_host: set[tuple[str, str]] = set()
-        regex: list[re.Pattern] = []
+        regex: list[tuple[int, re.Pattern]] = []
         for row in rows:
             mt = row["match_type"]
             if mt == "fingerprint":
@@ -98,7 +99,7 @@ def _load_suppressed_fingerprints() -> None:
                 ec_host.add((row["event_class"], row["match_host"]))
             elif mt == "message_regex":
                 try:
-                    regex.append(re.compile(row["match_pattern"]))
+                    regex.append((row["id"], re.compile(row["match_pattern"])))
                 except re.error as e:
                     print(f"[suppress] Invalid regex in rule: {row['match_pattern']!r}: {e}", flush=True)
         with _SUPPRESS_LOCK:
@@ -108,6 +109,25 @@ def _load_suppressed_fingerprints() -> None:
             _SUPPRESS_REGEX.clear(); _SUPPRESS_REGEX.extend(regex)
     except Exception as e:
         print(f"[suppress] Failed to load suppress rules: {e}", flush=True)
+
+
+def _flush_suppress_hits() -> None:
+    """Flush in-memory hit count deltas to the DB."""
+    with _SUPPRESS_LOCK:
+        if not _SUPPRESS_HITS:
+            return
+        deltas = dict(_SUPPRESS_HITS)
+        _SUPPRESS_HITS.clear()
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            for rule_id, count in deltas.items():
+                conn.execute(
+                    "UPDATE suppress_rules SET hit_count = hit_count + ? WHERE id = ?",
+                    (count, rule_id),
+                )
+            conn.commit()
+    except Exception as e:
+        print(f"[suppress] Failed to flush hit counts: {e}", flush=True)
 
 
 def extract_inner_message(raw: str) -> str:
@@ -414,6 +434,7 @@ def init_db() -> None:
         add_column_if_missing("suppress_rules", "match_type", "TEXT NOT NULL DEFAULT 'fingerprint'")
         add_column_if_missing("suppress_rules", "match_host", "TEXT NOT NULL DEFAULT ''")
         add_column_if_missing("suppress_rules", "match_pattern", "TEXT NOT NULL DEFAULT ''")
+        add_column_if_missing("suppress_rules", "hit_count", "INTEGER NOT NULL DEFAULT 0")
 
         conn.execute(
             """
@@ -798,7 +819,11 @@ def should_ignore(message: str) -> bool:
     # normalize_message() collapses multi-space but raw messages may have extra whitespace.
     normalized = re.sub(r"\s+", " ", message)
     with _SUPPRESS_LOCK:
-        return any(p.search(normalized) for p in _SUPPRESS_REGEX)
+        for rule_id, pat in _SUPPRESS_REGEX:
+            if pat.search(normalized):
+                _SUPPRESS_HITS[rule_id] = _SUPPRESS_HITS.get(rule_id, 0) + 1
+                return True
+    return False
 
 
 def extract_dozzle_event(payload: Any) -> dict[str, str]:
@@ -1516,6 +1541,11 @@ def analysis_loop() -> None:
             maybe_run_cleanup()
         except Exception as e:
             print(f"[analysis_loop] cleanup error: {e}", flush=True)
+
+        try:
+            _flush_suppress_hits()
+        except Exception as e:
+            print(f"[analysis_loop] flush suppress hits error: {e}", flush=True)
 
         time.sleep(interval)
 
@@ -3290,11 +3320,18 @@ def api_list_suppress_rules():
         rows = conn.execute(
             """
             SELECT id, match_type, canonical_fingerprint, match_host, match_pattern,
-                   incident_title, event_class, reason, created_at
+                   incident_title, event_class, reason, created_at, hit_count
             FROM suppress_rules ORDER BY created_at DESC
             """
         ).fetchall()
-    return {"items": [dict(row) for row in rows]}
+    items = []
+    with _SUPPRESS_LOCK:
+        pending = dict(_SUPPRESS_HITS)
+    for row in rows:
+        d = dict(row)
+        d["hit_count"] = (d.get("hit_count") or 0) + pending.get(d["id"], 0)
+        items.append(d)
+    return {"items": items}
 
 
 @app.delete("/api/suppress-rules/{rule_id}")

@@ -68,7 +68,7 @@ def call_ollama(prompt: str) -> tuple[dict[str, Any], str]:
         "format": "json",
         "options": {
             "temperature": 0.1,
-            "num_ctx": 32768,
+            "num_ctx": int(config.CONFIG["ollama"].get("num_ctx", 32768)),
         },
     }
 
@@ -136,6 +136,7 @@ def call_ollama_text(prompt: str) -> str:
         "stream": False,
         "options": {
             "temperature": 0.2,
+            "num_ctx": int(config.CONFIG["ollama"].get("num_ctx", 32768)),
         },
     }
 

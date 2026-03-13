@@ -10,6 +10,7 @@ ollama:
   model: qwen3.5:9b
     #model: qwen3.5:35b-a3b
   timeout_seconds: 300
+  num_ctx: 131072
 
 analysis:
   batch_window_minutes: 5

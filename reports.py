@@ -7,9 +7,92 @@ from datetime import datetime, timedelta
 from typing import Any
 
 import config
-from config import current_system_time_str, utcnow
+from config import current_system_time_str, safe_json_loads, utcnow
 from notifications import send_ntfy, truncate_for_ntfy
 from ollama import call_ollama_text
+
+
+# --- Shared helpers ---
+
+def _fetch_incident_summaries(cutoff_iso: str) -> list[dict[str, Any]]:
+    """Fetch analyzed open/recent incidents for report context."""
+    with sqlite3.connect(config.DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT id, status, severity, title, event_class, event_count,
+                   first_seen, last_seen, summary, probable_root_cause, confidence,
+                   affected_nodes, affected_services
+            FROM incidents
+            WHERE last_seen >= ?
+              AND summary IS NOT NULL AND summary != ''
+            ORDER BY
+                CASE severity WHEN 'critical' THEN 1 WHEN 'error' THEN 2
+                              WHEN 'warning' THEN 3 ELSE 4 END,
+                event_count DESC
+            LIMIT 15
+            """,
+            (cutoff_iso,),
+        ).fetchall()
+    return [
+        {
+            "id": r["id"], "status": r["status"], "severity": r["severity"],
+            "title": r["title"], "event_class": r["event_class"],
+            "event_count": r["event_count"], "first_seen": r["first_seen"],
+            "last_seen": r["last_seen"], "summary": r["summary"],
+            "probable_root_cause": r["probable_root_cause"] or "",
+            "confidence": r["confidence"] or "",
+            "affected_nodes": safe_json_loads(r["affected_nodes"], []),
+            "affected_services": safe_json_loads(r["affected_services"], []),
+        }
+        for r in rows
+    ]
+
+
+def _fetch_stats(cutoff_iso: str) -> dict[str, Any]:
+    """Fetch high-level stats for the report period."""
+    with sqlite3.connect(config.DB_PATH) as conn:
+        total_events = conn.execute(
+            "SELECT COUNT(*) FROM events WHERE created_at >= ?", (cutoff_iso,)
+        ).fetchone()[0]
+        by_severity = conn.execute(
+            """
+            SELECT COALESCE(severity_norm, 'unknown') AS sev, COUNT(*) AS cnt
+            FROM events WHERE created_at >= ?
+            GROUP BY sev ORDER BY cnt DESC
+            """,
+            (cutoff_iso,),
+        ).fetchall()
+        open_incidents = conn.execute(
+            "SELECT COUNT(*) FROM incidents WHERE status = 'open'"
+        ).fetchone()[0]
+        suppress_rules = conn.execute(
+            "SELECT COUNT(*) FROM suppress_rules"
+        ).fetchone()[0]
+        top_hosts = conn.execute(
+            """
+            SELECT host, COUNT(*) AS cnt FROM events
+            WHERE created_at >= ? AND host != ''
+            GROUP BY host ORDER BY cnt DESC LIMIT 5
+            """,
+            (cutoff_iso,),
+        ).fetchall()
+        top_containers = conn.execute(
+            """
+            SELECT container, COUNT(*) AS cnt FROM events
+            WHERE created_at >= ? AND container != ''
+            GROUP BY container ORDER BY cnt DESC LIMIT 5
+            """,
+            (cutoff_iso,),
+        ).fetchall()
+    return {
+        "total_events": total_events,
+        "by_severity": {r[0]: r[1] for r in by_severity},
+        "open_incidents": open_incidents,
+        "active_suppress_rules": suppress_rules,
+        "top_hosts": {r[0]: r[1] for r in top_hosts},
+        "top_containers": {r[0]: r[1] for r in top_containers},
+    }
 
 
 # --- Daily report ---
@@ -37,7 +120,9 @@ def fetch_events_for_lookback(hours: int) -> list[sqlite3.Row]:
 def group_events_for_daily(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
     grouped = defaultdict(lambda: {
         "count": 0, "source": "", "host": "", "container": "", "level": "",
-        "stream": "", "first_seen": None, "last_seen": None, "examples": [], "fingerprint": "",
+        "stream": "", "first_seen": None, "last_seen": None, "examples": [],
+        "fingerprint": "", "event_class": "", "severity_norm": "", "dependency": "",
+        "hosts_seen": set(),
     })
     max_examples = config.CONFIG["analysis"]["max_examples_per_group"]
     for row in rows:
@@ -46,81 +131,100 @@ def group_events_for_daily(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
         g["count"] += 1
         g["source"] = row["source"]; g["host"] = row["host"]; g["container"] = row["container"]
         g["level"] = row["level"]; g["stream"] = row["stream"]; g["fingerprint"] = row["fingerprint"]
+        if row["event_class"]:
+            g["event_class"] = row["event_class"]
+        if row["severity_norm"]:
+            g["severity_norm"] = row["severity_norm"]
+        if row["dependency"]:
+            g["dependency"] = row["dependency"]
+        if row["host"]:
+            g["hosts_seen"].add(row["host"])
         created_at = row["created_at"]
         if g["first_seen"] is None:
             g["first_seen"] = created_at
         g["last_seen"] = created_at
         if len(g["examples"]) < max_examples:
             g["examples"].append(row["message"])
-    return sorted(grouped.values(), key=lambda x: x["count"], reverse=True)
+
+    output = []
+    for g in grouped.values():
+        out = dict(g)
+        out["hosts_seen"] = sorted(out["hosts_seen"])
+        output.append(out)
+    return sorted(output, key=lambda x: x["count"], reverse=True)
 
 
-def build_daily_report_prompt(groups: list[dict[str, Any]], lookback_hours: int) -> str:
-    payload = {"lookback_hours": lookback_hours, "groups": groups}
-    return f"""
-You are a homelab SRE generating a daily operations digest from infrastructure alert events.
+def build_daily_report_prompt(groups: list[dict[str, Any]], lookback_hours: int,
+                              stats: dict[str, Any], incidents: list[dict[str, Any]]) -> str:
+    # Cap groups: top 20 by count, drop examples for noise (>3rd group)
+    trimmed_groups = []
+    for i, g in enumerate(groups[:20]):
+        entry = {k: v for k, v in g.items() if k != "examples"}
+        if i < 8:
+            entry["examples"] = g["examples"][:3]
+        else:
+            entry["examples"] = [g["examples"][0]] if g["examples"] else []
+        trimmed_groups.append(entry)
 
-Current system date/time: {current_system_time_str()}
-Assume this date is correct.
-Do not question or validate the system clock unless the input explicitly shows clock drift evidence.
+    payload = {
+        "period": f"last {lookback_hours} hours",
+        "stats": stats,
+        "analyzed_incidents": incidents[:10],
+        "event_groups": trimmed_groups,
+    }
 
-Your job:
-- identify the most important operational issues
-- separate real problems from repetitive noise
-- keep the report concise
-- prioritize service-impacting problems
+    data_json = json.dumps(payload, ensure_ascii=False, indent=2)
 
-Output rules:
-- Output plain text only
-- Do not output JSON
-- Do not output markdown code fences
-- Do not use conversational language
-- Do not ask questions
-- Do not offer help
-- Do not address the reader directly
-- Maximum length: 1200 characters
-- If there are no serious problems, say so clearly
+    return f"""You are a homelab SRE writing a daily operations report.
 
-Write the report in exactly this structure:
+Current date/time: {current_system_time_str()}
+
+INPUT DATA:
+{data_json}
+
+INSTRUCTIONS:
+Write the report as plain text in exactly this structure. Omit any section that has no items.
 
 Overall Status: Healthy|Warning|Critical
 
 Summary:
-<2-4 short sentences summarizing the day>
+<2-4 sentences: what happened today, what matters, what does not>
 
 Critical Issues:
-- <source/container>: <issue> — <brief impact/action>
+- <container/host>: <issue> (<count> events) — <impact and recommended action>
 
 Warnings:
-- <source/container>: <issue> — <brief impact/action>
+- <container/host>: <issue> (<count> events) — <brief note>
 
-Noise / Likely Harmless:
-- <source/container>: <short description>
+Noise / Suppressed:
+- <container>: <short description>
 
-Classification guidance:
-- Critical = service crashes, database failures, repeated connection failures, disk/full filesystem issues, OOM, panic/fatal/segfault, persistent upstream failures, repeated failed logons,
-- Warning = transient errors, rate limits, lock contention, repeated retries, degraded features, missing cache directories, one-off failed logons, isolated service failures
-- Noise / Likely Harmless = one-off warnings, routine transfer stats, benign retries, expected disconnects, repetitive low-value log spam
+Stats: <total_events> events, <open_incidents> open incidents, <suppress_rules> active suppress rules
 
-Selection rules:
-- Prefer recurring and service-impacting issues
-- Collapse repeated similar events into one bullet
-- Omit empty sections
-- Ignore stack trace details unless they change the diagnosis
-- Do not mention every event; summarize patterns
-
-Input:
-{json.dumps(payload, ensure_ascii=False, indent=2)}
-""".strip()
+RULES:
+- Use the "analyzed_incidents" section — these contain LLM-analyzed root causes. Incorporate them.
+- Use "event_class" and "severity_norm" fields to classify, not just the raw message text.
+- Critical = service crashes, DB failures, repeated connection failures, disk full, OOM, panic/fatal, persistent upstream failures
+- Warning = transient errors, lock contention, retries, degraded features, isolated failures
+- Noise = one-off warnings, routine stats, benign retries, already-suppressed patterns
+- Collapse similar issues into one bullet with combined counts.
+- Do not list every group. Summarize patterns.
+- Maximum 2000 characters. Plain text only. No markdown, no tables, no code fences.
+- Do not use conversational language. Do not ask questions. Do not offer help.""".strip()
 
 
 def clean_daily_report_text(text: str) -> str:
     text = text.strip()
+    # Strip thinking tags if model leaked them
+    text = re.sub(r"<think>[\s\S]*?</think>\s*", "", text).strip()
     text = re.sub(
         r"\n*(Would you like.*|Let me know.*|If you want.*|I can help.*)$",
         "", text, flags=re.IGNORECASE | re.DOTALL,
     ).strip()
-    text = text.replace("**", "").replace("### ", "")
+    text = text.replace("**", "").replace("### ", "").replace("## ", "").replace("# ", "")
+    # Remove markdown tables
+    text = re.sub(r"\|[^\n]+\|\n", "", text)
+    text = re.sub(r"\|[-:| ]+\|\n", "", text)
     if not text.startswith("Overall Status:"):
         text = "Overall Status: Warning\n\n" + text
     return text
@@ -138,8 +242,11 @@ def send_daily_report() -> None:
         print("[daily_report] sent healthy empty report", flush=True)
         return
 
+    cutoff_iso = (utcnow() - timedelta(hours=lookback_hours)).isoformat()
     groups = group_events_for_daily(rows)
-    prompt = build_daily_report_prompt(groups, lookback_hours)
+    stats = _fetch_stats(cutoff_iso)
+    incidents = _fetch_incident_summaries(cutoff_iso)
+    prompt = build_daily_report_prompt(groups, lookback_hours, stats, incidents)
 
     try:
         report_body = call_ollama_text(prompt).strip()
@@ -209,7 +316,8 @@ def group_events_for_weekly(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
     grouped = defaultdict(lambda: {
         "count": 0, "source": "", "container": "", "host": "", "level": "",
         "stream": "", "first_seen": None, "last_seen": None, "examples": [],
-        "fingerprint": "", "days_seen": set(),
+        "fingerprint": "", "event_class": "", "severity_norm": "", "dependency": "",
+        "days_seen": set(), "hosts_seen": set(),
     })
     max_examples = config.CONFIG["analysis"]["max_examples_per_group"]
     for row in rows:
@@ -218,6 +326,14 @@ def group_events_for_weekly(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
         g["count"] += 1
         g["source"] = row["source"]; g["container"] = row["container"]; g["host"] = row["host"]
         g["level"] = row["level"]; g["stream"] = row["stream"]; g["fingerprint"] = row["fingerprint"]
+        if row["event_class"]:
+            g["event_class"] = row["event_class"]
+        if row["severity_norm"]:
+            g["severity_norm"] = row["severity_norm"]
+        if row["dependency"]:
+            g["dependency"] = row["dependency"]
+        if row["host"]:
+            g["hosts_seen"].add(row["host"])
         created_at = row["created_at"]
         g["days_seen"].add(str(created_at)[:10])
         if g["first_seen"] is None:
@@ -231,49 +347,67 @@ def group_events_for_weekly(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
         out = dict(g)
         out["days_seen"] = sorted(out["days_seen"])
         out["days_seen_count"] = len(out["days_seen"])
+        out["hosts_seen"] = sorted(out["hosts_seen"])
         output.append(out)
     return sorted(output, key=lambda x: (x["days_seen_count"], x["count"]), reverse=True)
 
 
-def build_weekly_report_prompt(groups: list[dict[str, Any]], lookback_days: int) -> str:
-    payload = {"lookback_days": lookback_days, "groups": groups[:30]}
-    return f"""
-You are generating a weekly homelab reliability report from infrastructure alert events.
+def build_weekly_report_prompt(groups: list[dict[str, Any]], lookback_days: int,
+                               stats: dict[str, Any], incidents: list[dict[str, Any]]) -> str:
+    trimmed_groups = []
+    for i, g in enumerate(groups[:25]):
+        entry = {k: v for k, v in g.items() if k != "examples"}
+        if i < 10:
+            entry["examples"] = [g["examples"][0]] if g["examples"] else []
+        trimmed_groups.append(entry)
 
-Current system date/time: {current_system_time_str()}
-Assume this date is correct.
-Do not question or validate the system clock unless the input explicitly shows clock drift evidence.
+    payload = {
+        "period": f"last {lookback_days} days",
+        "stats": stats,
+        "analyzed_incidents": incidents[:10],
+        "event_groups": trimmed_groups,
+    }
 
-Output plain text only in exactly this structure:
+    data_json = json.dumps(payload, ensure_ascii=False, indent=2)
+
+    return f"""You are a homelab SRE writing a weekly reliability report.
+
+Current date/time: {current_system_time_str()}
+
+INPUT DATA:
+{data_json}
+
+INSTRUCTIONS:
+Write the report as plain text in exactly this structure. Omit any section that has no items.
 
 Overall Status: Healthy|Warning|Critical
 
 Summary:
-<2-4 short sentences>
+<2-4 sentences: week overview, trends, key concerns>
 
 Top Recurring Issues:
-- <source/container>: <issue> — <count/trend/impact>
+- <container/host>: <issue> — seen <days_seen_count> days, <count> events — <impact>
 
-Top Noisy Sources:
-- <source/container>: <short description>
+Emerging Trends:
+- <observation about changes this week>
 
 Recommended Actions:
 - <short operational action>
 
-Rules:
-- Do not ask questions
-- Do not offer help
-- Do not address the reader directly
-- Do not use markdown headings like ### or **
-- Maximum length: 1600 characters
-- Prioritize recurring and service-impacting issues
-- Collapse repeated similar events into one bullet
-- Mention harmless noise only if it is very frequent
-- Prefer issues seen on multiple days over one-off bursts
+Noisy Sources:
+- <container>: <count> events — <consider suppressing?>
 
-Input:
-{json.dumps(payload, ensure_ascii=False, indent=2)}
-""".strip()
+Stats: <total_events> events across <num_hosts> hosts, <open_incidents> open incidents
+
+RULES:
+- Use "analyzed_incidents" for root cause context. Incorporate their summaries.
+- Use "days_seen_count" to identify persistent vs one-off issues. Persistent issues matter more.
+- Use "event_class" and "severity_norm" to classify severity.
+- Critical = recurring service-impacting issues seen on multiple days
+- Warning = intermittent issues or single-day bursts
+- Collapse similar issues. Do not list every group.
+- Maximum 2500 characters. Plain text only. No markdown, no tables, no code fences.
+- Do not use conversational language. Do not ask questions. Do not offer help.""".strip()
 
 
 def send_weekly_report() -> None:
@@ -288,8 +422,11 @@ def send_weekly_report() -> None:
         print("[weekly_report] sent empty healthy report", flush=True)
         return
 
-    groups = group_events_for_weekly(rows)[:20]
-    prompt = build_weekly_report_prompt(groups, lookback_days)
+    cutoff_iso = (utcnow() - timedelta(days=lookback_days)).isoformat()
+    groups = group_events_for_weekly(rows)[:25]
+    stats = _fetch_stats(cutoff_iso)
+    incidents = _fetch_incident_summaries(cutoff_iso)
+    prompt = build_weekly_report_prompt(groups, lookback_days, stats, incidents)
 
     try:
         report_body = call_ollama_text(prompt).strip()

@@ -3,7 +3,7 @@ import sqlite3
 
 import requests
 
-import config
+from core import config
 
 
 def truncate_for_ntfy(text: str, max_chars: int = 3500) -> str:

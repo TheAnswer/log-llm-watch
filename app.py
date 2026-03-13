@@ -8,9 +8,9 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 
-from background import _check_ollama_health, _run_backfill, analysis_loop
-from database import init_db
-from suppression import load_suppressed_fingerprints
+from services.background import _check_ollama_health, _run_backfill, analysis_loop
+from core.database import init_db
+from services.suppression import load_suppressed_fingerprints
 
 from routes.webhooks import router as webhooks_router
 from routes.incidents_api import router as incidents_router

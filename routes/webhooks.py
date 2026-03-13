@@ -5,8 +5,8 @@ from functools import partial
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
 
-from extraction import extract_dozzle_event, extract_syslog_event, extract_windows_event
-from ingestion import ingest_event, _THREAD_POOL
+from core.extraction import extract_dozzle_event, extract_syslog_event, extract_windows_event
+from services.ingestion import ingest_event, _THREAD_POOL
 
 router = APIRouter()
 

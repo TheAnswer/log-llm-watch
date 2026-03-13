@@ -6,8 +6,8 @@ import threading
 import time
 from typing import Any
 
-import config
-from normalize import extract_inner_message
+from core import config
+from core.normalize import extract_inner_message
 
 # In-memory suppression caches
 _SUPPRESS_FP: set[str] = set()
@@ -114,7 +114,7 @@ def template_to_suppress_pattern(template: str) -> str:
 def _llm_generate_suppress_regex(groups: list[dict[str, Any]]) -> dict[str, str]:
     """Ask the LLM to generate a regex for each ignored group."""
     # Import here to avoid circular dependency at module level
-    from ollama import call_ollama
+    from services.ollama import call_ollama
 
     if not groups:
         return {}

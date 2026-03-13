@@ -8,9 +8,9 @@ from typing import Any
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse
 
-import config
-from config import safe_json_loads, utcnow
-from incidents import (
+from core import config
+from core.config import safe_json_loads, utcnow
+from services.incidents import (
     analyze_incident_with_ollama,
     analyze_missing_incidents,
     build_incident_context,
@@ -18,7 +18,7 @@ from incidents import (
     build_incident_llm_context,
     generate_open_incidents_digest,
 )
-from suppression import load_suppressed_fingerprints
+from services.suppression import load_suppressed_fingerprints
 
 router = APIRouter()
 

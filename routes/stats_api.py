@@ -4,9 +4,9 @@ from datetime import timedelta
 
 from fastapi import APIRouter
 
-import config
-from config import utcnow
-from ollama import _LLM_STATS
+from core import config
+from core.config import utcnow
+from services.ollama import _LLM_STATS
 
 router = APIRouter()
 

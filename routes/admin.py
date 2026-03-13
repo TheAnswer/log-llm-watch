@@ -2,10 +2,10 @@
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 
-import config
-from housekeeping import vacuum_db
-from ingestion import backfill_existing_events
-from reports import send_daily_report, send_weekly_report
+from core import config
+from services.housekeeping import vacuum_db
+from services.ingestion import backfill_existing_events
+from services.reports import send_daily_report, send_weekly_report
 
 router = APIRouter()
 

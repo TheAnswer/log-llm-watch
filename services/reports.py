@@ -6,10 +6,10 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 from typing import Any
 
-import config
-from config import current_system_time_str, safe_json_loads, utcnow
-from notifications import send_ntfy, truncate_for_ntfy
-from ollama import call_ollama_text
+from core import config
+from core.config import current_system_time_str, safe_json_loads, utcnow
+from services.notifications import send_ntfy, truncate_for_ntfy
+from services.ollama import call_ollama_text
 
 
 # --- Shared helpers ---

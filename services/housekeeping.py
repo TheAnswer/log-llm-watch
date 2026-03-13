@@ -2,8 +2,8 @@
 import sqlite3
 from datetime import datetime, timedelta
 
-import config
-from config import utcnow
+from core import config
+from core.config import utcnow
 
 
 def cleanup_old_data() -> None:
@@ -75,7 +75,7 @@ def mark_housekeeping_ran(run_key: str) -> None:
 
 def cleanup_stale_suppress_rules(days: int = 30) -> int:
     """Remove auto-created suppress rules with no hits in the last N days."""
-    from suppression import load_suppressed_fingerprints
+    from services.suppression import load_suppressed_fingerprints
 
     cutoff = (utcnow() - timedelta(days=days)).isoformat()
     with sqlite3.connect(config.DB_PATH) as conn:

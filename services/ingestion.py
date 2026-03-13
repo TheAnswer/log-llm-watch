@@ -6,12 +6,12 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
-import config
-from config import utcnow
-from database import db
-from incidents import attach_or_create_incident
-from normalize import enrich_event
-from suppression import log_ignored, should_ignore
+from core import config
+from core.config import utcnow
+from core.database import db
+from services.incidents import attach_or_create_incident
+from core.normalize import enrich_event
+from services.suppression import log_ignored, should_ignore
 
 _THREAD_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="db")
 _INCIDENT_LOCK = threading.Lock()

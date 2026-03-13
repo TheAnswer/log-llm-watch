@@ -2,7 +2,7 @@
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse
 
-from incidents import (
+from services.incidents import (
     analyze_incident_with_ollama,
     build_incident_llm_context,
     generate_open_incidents_digest,

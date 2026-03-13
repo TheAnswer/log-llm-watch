@@ -8,15 +8,15 @@ from typing import Any
 
 import requests
 
-import config
-from config import utcnow
-from database import db
-from housekeeping import maybe_run_cleanup
-from incidents import analyze_missing_incidents, close_stale_incidents
-from notifications import send_ntfy
-from ollama import call_ollama
-from reports import maybe_send_daily_report, maybe_send_weekly_report
-from suppression import auto_suppress_ignored, flush_suppress_hits
+from core import config
+from core.config import utcnow
+from core.database import db
+from services.housekeeping import maybe_run_cleanup
+from services.incidents import analyze_missing_incidents, close_stale_incidents
+from services.notifications import send_ntfy
+from services.ollama import call_ollama
+from services.reports import maybe_send_daily_report, maybe_send_weekly_report
+from services.suppression import auto_suppress_ignored, flush_suppress_hits
 
 
 def fetch_unprocessed_events() -> list[sqlite3.Row]:
@@ -175,7 +175,7 @@ def analyze_once() -> None:
 
 
 def _run_backfill() -> None:
-    from ingestion import backfill_existing_events
+    from services.ingestion import backfill_existing_events
     try:
         while True:
             n = backfill_existing_events(limit=500)

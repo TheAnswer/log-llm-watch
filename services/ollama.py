@@ -9,7 +9,7 @@ from typing import Any
 
 import requests
 
-import config
+from core import config
 
 _OLLAMA_LOCK = threading.Lock()
 

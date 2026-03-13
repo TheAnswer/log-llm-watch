@@ -3,7 +3,7 @@ import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 
-import config
+from core import config
 
 
 def init_db() -> None:

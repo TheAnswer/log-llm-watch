@@ -8,12 +8,12 @@ from typing import Any
 
 from fastapi import HTTPException
 
-import config
-from config import safe_json_loads, utcnow
-from database import db
-from normalize import enrich_event
-from ollama import call_ollama
-from suppression import (
+from core import config
+from core.config import safe_json_loads, utcnow
+from core.database import db
+from core.normalize import enrich_event
+from services.ollama import call_ollama
+from services.suppression import (
     _SUPPRESS_EC, _SUPPRESS_EC_HOST, _SUPPRESS_FP, _SUPPRESS_LOCK,
     load_suppressed_fingerprints, template_to_suppress_pattern,
 )

@@ -4,7 +4,7 @@ import json
 import re
 from typing import Any
 
-import config
+from core import config
 
 
 def extract_inner_message(raw: str) -> str:

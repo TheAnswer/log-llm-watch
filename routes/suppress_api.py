@@ -3,8 +3,8 @@ import sqlite3
 
 from fastapi import APIRouter, HTTPException
 
-import config
-from suppression import load_suppressed_fingerprints, _SUPPRESS_HITS, _SUPPRESS_LOCK
+from core import config
+from services.suppression import load_suppressed_fingerprints, _SUPPRESS_HITS, _SUPPRESS_LOCK
 
 router = APIRouter()
 

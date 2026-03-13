@@ -5,8 +5,8 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException
 
-import config
-from config import utcnow
+from core import config
+from core.config import utcnow
 
 router = APIRouter()
 

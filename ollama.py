@@ -16,27 +16,47 @@ _LLM_STATS: dict[str, float | int] = {
     "total_calls": 0,
     "total_errors": 0,
     "total_seconds": 0.0,
+    "total_prompt_tokens": 0,
+    "total_completion_tokens": 0,
     "last_call_at": "",
     "last_duration_seconds": 0.0,
 }
 
 
-def _record_llm_call(duration: float, error: bool = False) -> None:
+def _record_llm_call(
+    duration: float,
+    error: bool = False,
+    prompt_tokens: int = 0,
+    completion_tokens: int = 0,
+    model: str = "",
+) -> None:
     _LLM_STATS["total_calls"] += 1
     if error:
         _LLM_STATS["total_errors"] += 1
     _LLM_STATS["total_seconds"] += duration
+    _LLM_STATS["total_prompt_tokens"] += prompt_tokens
+    _LLM_STATS["total_completion_tokens"] += completion_tokens
     _LLM_STATS["last_call_at"] = config.utcnow().isoformat()
     _LLM_STATS["last_duration_seconds"] = duration
     try:
         with sqlite3.connect(config.DB_PATH) as conn:
             conn.execute(
-                "INSERT INTO llm_call_log (called_at, duration_seconds, error) VALUES (?, ?, ?)",
-                (config.utcnow().isoformat(), round(duration, 3), 1 if error else 0),
+                "INSERT INTO llm_call_log (called_at, duration_seconds, error, prompt_tokens, completion_tokens, model) VALUES (?, ?, ?, ?, ?, ?)",
+                (config.utcnow().isoformat(), round(duration, 3), 1 if error else 0,
+                 prompt_tokens, completion_tokens, model),
             )
             conn.commit()
     except Exception as e:
         print(f"[llm_stats] Failed to log call: {e}", flush=True)
+
+
+def _extract_token_stats(data: dict) -> dict[str, Any]:
+    """Extract token counts and model from an Ollama response."""
+    return {
+        "prompt_tokens": int(data.get("prompt_eval_count") or 0),
+        "completion_tokens": int(data.get("eval_count") or 0),
+        "model": str(data.get("model") or ""),
+    }
 
 
 def call_ollama(prompt: str) -> tuple[dict[str, Any], str]:
@@ -53,11 +73,13 @@ def call_ollama(prompt: str) -> tuple[dict[str, Any], str]:
     }
 
     t0 = time.monotonic()
+    token_stats: dict[str, Any] = {}
     try:
         with _OLLAMA_LOCK:
             r = requests.post(url, json=body, timeout=config.CONFIG["ollama"]["timeout_seconds"])
         r.raise_for_status()
         data = r.json()
+        token_stats = _extract_token_stats(data)
 
         if data.get("done_reason") == "length":
             raise ValueError("Ollama response truncated (hit context limit).")
@@ -73,7 +95,7 @@ def call_ollama(prompt: str) -> tuple[dict[str, Any], str]:
 
         try:
             result = json.loads(cleaned), cleaned
-            _record_llm_call(time.monotonic() - t0)
+            _record_llm_call(time.monotonic() - t0, **token_stats)
             return result
         except json.JSONDecodeError:
             pass
@@ -84,7 +106,7 @@ def call_ollama(prompt: str) -> tuple[dict[str, Any], str]:
 
         try:
             result = json.loads(cleaned), candidate
-            _record_llm_call(time.monotonic() - t0)
+            _record_llm_call(time.monotonic() - t0, **token_stats)
             return result
         except json.JSONDecodeError:
             pass
@@ -95,14 +117,14 @@ def call_ollama(prompt: str) -> tuple[dict[str, Any], str]:
             extracted = cleaned[start:end + 1]
             try:
                 result = json.loads(extracted), candidate
-                _record_llm_call(time.monotonic() - t0)
+                _record_llm_call(time.monotonic() - t0, **token_stats)
                 return result
             except json.JSONDecodeError:
                 pass
 
         raise ValueError(f"Could not parse Ollama JSON response. Candidate: {candidate!r}")
     except Exception:
-        _record_llm_call(time.monotonic() - t0, error=True)
+        _record_llm_call(time.monotonic() - t0, error=True, **token_stats)
         raise
 
 
@@ -118,11 +140,13 @@ def call_ollama_text(prompt: str) -> str:
     }
 
     t0 = time.monotonic()
+    token_stats: dict[str, Any] = {}
     try:
         with _OLLAMA_LOCK:
             r = requests.post(url, json=body, timeout=config.CONFIG["ollama"]["timeout_seconds"])
         r.raise_for_status()
         data = r.json()
+        token_stats = _extract_token_stats(data)
 
         raw_response = (data.get("response") or "").strip()
         raw_thinking = (data.get("thinking") or "").strip()
@@ -130,8 +154,8 @@ def call_ollama_text(prompt: str) -> str:
         if not text:
             raise ValueError(f"Ollama returned empty response. Full payload: {data!r}")
 
-        _record_llm_call(time.monotonic() - t0)
+        _record_llm_call(time.monotonic() - t0, **token_stats)
         return text
     except Exception:
-        _record_llm_call(time.monotonic() - t0, error=True)
+        _record_llm_call(time.monotonic() - t0, error=True, **token_stats)
         raise

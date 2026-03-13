@@ -156,6 +156,9 @@ def init_db() -> None:
             )
             """
         )
+        add_column_if_missing("llm_call_log", "prompt_tokens", "INTEGER NOT NULL DEFAULT 0")
+        add_column_if_missing("llm_call_log", "completion_tokens", "INTEGER NOT NULL DEFAULT 0")
+        add_column_if_missing("llm_call_log", "model", "TEXT NOT NULL DEFAULT ''")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_llm_call_log_called_at ON llm_call_log(called_at)")
 
         conn.execute(

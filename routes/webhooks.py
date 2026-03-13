@@ -49,4 +49,4 @@ async def syslog_webhook(request: Request):
     event = extract_syslog_event(payload)
     loop = asyncio.get_running_loop()
     result = await loop.run_in_executor(_THREAD_POOL, partial(ingest_event, payload, event))
-    return JSONResponse(result, headers={"Connection": "close"})
+    return JSONResponse(result)

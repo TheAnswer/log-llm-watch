@@ -179,6 +179,7 @@ def init_db() -> None:
         add_column_if_missing("suppress_rules", "match_host", "TEXT NOT NULL DEFAULT ''")
         add_column_if_missing("suppress_rules", "match_pattern", "TEXT NOT NULL DEFAULT ''")
         add_column_if_missing("suppress_rules", "hit_count", "INTEGER NOT NULL DEFAULT 0")
+        add_column_if_missing("suppress_rules", "last_hit_at", "TEXT")
 
         conn.execute(
             """

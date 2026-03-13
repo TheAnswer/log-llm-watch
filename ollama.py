@@ -84,6 +84,17 @@ def call_ollama(prompt: str) -> tuple[dict[str, Any], str]:
         if data.get("done_reason") == "length":
             raise ValueError("Ollama response truncated (hit context limit).")
 
+        # Warn if prompt was close to or exceeded context window
+        prompt_tokens = int(data.get("prompt_eval_count") or 0)
+        completion_tokens = int(data.get("eval_count") or 0)
+        num_ctx = int(body.get("options", {}).get("num_ctx", 0))
+        if num_ctx and prompt_tokens + completion_tokens >= num_ctx * 0.95:
+            print(
+                f"[ollama] WARNING: near context limit — prompt={prompt_tokens} + completion={completion_tokens}"
+                f" = {prompt_tokens + completion_tokens} tokens vs num_ctx={num_ctx}",
+                flush=True,
+            )
+
         raw_response = (data.get("response") or "").strip()
         raw_thinking = (data.get("thinking") or "").strip()
         candidate = raw_response or raw_thinking
@@ -148,6 +159,16 @@ def call_ollama_text(prompt: str) -> str:
         r.raise_for_status()
         data = r.json()
         token_stats = _extract_token_stats(data)
+
+        prompt_tokens = int(data.get("prompt_eval_count") or 0)
+        completion_tokens = int(data.get("eval_count") or 0)
+        num_ctx = int(body.get("options", {}).get("num_ctx", 0))
+        if num_ctx and prompt_tokens + completion_tokens >= num_ctx * 0.95:
+            print(
+                f"[ollama] WARNING: near context limit — prompt={prompt_tokens} + completion={completion_tokens}"
+                f" = {prompt_tokens + completion_tokens} tokens vs num_ctx={num_ctx}",
+                flush=True,
+            )
 
         raw_response = (data.get("response") or "").strip()
         raw_thinking = (data.get("thinking") or "").strip()

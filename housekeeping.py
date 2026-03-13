@@ -73,6 +73,34 @@ def mark_housekeeping_ran(run_key: str) -> None:
         conn.commit()
 
 
+def cleanup_stale_suppress_rules(days: int = 30) -> int:
+    """Remove auto-created suppress rules with no hits in the last N days."""
+    from suppression import load_suppressed_fingerprints
+
+    cutoff = (utcnow() - timedelta(days=days)).isoformat()
+    with sqlite3.connect(config.DB_PATH) as conn:
+        # Only prune auto-created rules (reason starts with "auto:")
+        # that have never been hit, or whose last hit is older than cutoff
+        cur = conn.execute(
+            """
+            DELETE FROM suppress_rules
+            WHERE reason LIKE 'auto:%'
+              AND (
+                  (last_hit_at IS NULL AND created_at < ?)
+                  OR (last_hit_at IS NOT NULL AND last_hit_at < ?)
+              )
+            """,
+            (cutoff, cutoff),
+        )
+        deleted = cur.rowcount
+        conn.commit()
+
+    if deleted:
+        load_suppressed_fingerprints()
+        print(f"[cleanup] pruned {deleted} stale suppress rules (no hits in {days}d)", flush=True)
+    return deleted
+
+
 def maybe_run_cleanup() -> None:
     now = datetime.now()
     run_key = housekeeping_run_key("cleanup", now)
@@ -80,4 +108,6 @@ def maybe_run_cleanup() -> None:
         return
     if now.hour >= 3:
         cleanup_old_data()
+        suppress_days = int(config.CONFIG.get("retention", {}).get("suppress_rules_stale_days", 30))
+        cleanup_stale_suppress_rules(days=suppress_days)
         mark_housekeeping_ran(run_key)

@@ -16,7 +16,7 @@ def api_list_suppress_rules():
         rows = conn.execute(
             """
             SELECT id, match_type, canonical_fingerprint, match_host, match_pattern,
-                   incident_title, event_class, reason, created_at, hit_count
+                   incident_title, event_class, reason, created_at, hit_count, last_hit_at
             FROM suppress_rules ORDER BY created_at DESC
             """
         ).fetchall()

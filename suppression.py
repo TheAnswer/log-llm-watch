@@ -78,8 +78,8 @@ def flush_suppress_hits() -> None:
         with sqlite3.connect(config.DB_PATH) as conn:
             for rule_id, count in deltas.items():
                 conn.execute(
-                    "UPDATE suppress_rules SET hit_count = hit_count + ? WHERE id = ?",
-                    (count, rule_id),
+                    "UPDATE suppress_rules SET hit_count = hit_count + ?, last_hit_at = ? WHERE id = ?",
+                    (count, config.utcnow().isoformat(), rule_id),
                 )
             conn.commit()
     except Exception as e:

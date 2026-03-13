@@ -66,6 +66,22 @@ def api_llm_stats(days: int = 7):
     }
 
 
+@router.get("/api/llm-log")
+def api_llm_log(limit: int = 50):
+    limit = max(1, min(limit, 200))
+    with sqlite3.connect(config.DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT id, called_at, duration_seconds, error, prompt_tokens, completion_tokens,
+                   model, caller, response_preview
+            FROM llm_call_log ORDER BY id DESC LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    return {"items": [dict(r) for r in rows]}
+
+
 @router.get("/api/ntfy-log")
 def api_ntfy_log(limit: int = 50):
     limit = max(1, min(limit, 200))

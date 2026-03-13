@@ -8,6 +8,8 @@ venv/
 
 # database
 events.sqlite3
+events.sqlite3-shm
+events.sqlite3-wal
 
 # system files
 *.log

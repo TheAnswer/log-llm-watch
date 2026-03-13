@@ -177,7 +177,7 @@ def close_stale_incidents() -> None:
     cutoff = (utcnow() - timedelta(minutes=stale_minutes)).isoformat()
     with db() as conn:
         conn.execute(
-            "UPDATE incidents SET status = 'closed', updated_at = ? WHERE status = 'open' AND last_seen < ?",
+            "UPDATE incidents SET status = 'closed', updated_at = ? WHERE status = 'open' AND severity != 'critical' AND last_seen < ?",
             (utcnow().isoformat(), cutoff),
         )
         conn.commit()
@@ -659,10 +659,13 @@ def analyze_missing_incidents(
             is_fp = result["analysis"].get("is_false_positive", False)
 
             if is_fp and root_cause in _FALSE_POSITIVE_LABELS and confidence_val in ("medium", "high"):
-                try:
-                    auto_close_false_positive(incident_id, confidence_val)
-                except Exception as e:
-                    print(f"[auto-close] error for incident #{incident_id}: {e}", flush=True)
+                if row["severity"] == "critical":
+                    print(f"[auto-close] skipping critical incident #{incident_id}", flush=True)
+                else:
+                    try:
+                        auto_close_false_positive(incident_id, confidence_val)
+                    except Exception as e:
+                        print(f"[auto-close] error for incident #{incident_id}: {e}", flush=True)
 
             processed.append({
                 "incident_id": incident_id, "status": row["status"],

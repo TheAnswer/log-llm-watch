@@ -1,4 +1,4 @@
-# Homelab LLM Watch
+# Log LLM Watch
 
 A FastAPI service that ingests infrastructure logs from multiple sources (Dozzle/Docker, Windows Event Logs, syslog), clusters them into incidents, and uses a local Ollama LLM to analyze root causes, generate suppression rules, and produce daily/weekly health reports — all delivered via ntfy notifications.
 
@@ -45,7 +45,7 @@ A FastAPI service that ingests infrastructure logs from multiple sources (Dozzle
 ## Project Structure
 
 ```
-/opt/dozzle-llm-watch/
+/opt/log-llm-watch/
 ├── app.py                      # FastAPI entry point, middleware, router wiring
 ├── config.yaml                 # All runtime configuration
 ├── requirements.txt            # Python dependencies
@@ -110,7 +110,7 @@ core/  -->  services/  -->  routes/  -->  app.py
 ### Installation
 
 ```bash
-cd /opt/dozzle-llm-watch
+cd /opt/log-llm-watch
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
@@ -132,7 +132,7 @@ notify:
   title: "NAS log alert"
 
 storage:
-  db_path: "/opt/dozzle-llm-watch/events.sqlite3"
+  db_path: "/opt/log-llm-watch/events.sqlite3"
 ```
 
 Other configuration options:
@@ -162,7 +162,7 @@ source venv/bin/activate
 uvicorn app:app --host 0.0.0.0 --port 8088 --timeout-keep-alive 65
 ```
 
-**Systemd service** (`/etc/systemd/system/dozzle-llm-watch.service`):
+**Systemd service** (`/etc/systemd/system/log-llm-watch.service`):
 
 ```ini
 [Unit]
@@ -172,9 +172,9 @@ After=network.target
 [Service]
 Type=simple
 User=theanswer
-WorkingDirectory=/opt/dozzle-llm-watch
+WorkingDirectory=/opt/log-llm-watch
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/opt/dozzle-llm-watch/venv/bin/uvicorn app:app --host 0.0.0.0 --port 8088 --timeout-keep-alive 65
+ExecStart=/opt/log-llm-watch/venv/bin/uvicorn app:app --host 0.0.0.0 --port 8088 --timeout-keep-alive 65
 Restart=always
 RestartSec=5
 
@@ -186,7 +186,7 @@ WantedBy=multi-user.target
 
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable --now dozzle-llm-watch
+sudo systemctl enable --now log-llm-watch
 ```
 
 ## Webhook Ingestion
@@ -384,3 +384,7 @@ SQLite with WAL mode. Schema is auto-created and auto-migrated on startup via `a
 ## Frontend
 
 A separate React dashboard is available at [`homelab-incident-dashboard`](../homelab-incident-dashboard/) for visualizing incidents, events, LLM stats, and suppression rules.
+
+## License
+
+This project is licensed under the [GNU General Public License v3.0](LICENSE).

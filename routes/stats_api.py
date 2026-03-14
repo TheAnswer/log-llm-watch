@@ -113,9 +113,20 @@ def api_event_stats(days: int = 7):
         suppress_rules = conn.execute(
             "SELECT COUNT(*) FROM suppress_rules"
         ).fetchone()[0]
+        cutoff_day = (utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
+        total_ignored = conn.execute(
+            "SELECT COALESCE(SUM(count), 0) FROM ignored_daily WHERE day >= ?",
+            (cutoff_day,),
+        ).fetchone()[0]
+        total_suppressed = conn.execute(
+            "SELECT COUNT(*) FROM events WHERE created_at >= ? AND suppressed = 1",
+            (cutoff,),
+        ).fetchone()[0]
     return {
         "period_days": days,
         "total_stored": total_stored,
+        "total_ignored": total_ignored,
+        "total_suppressed": total_suppressed,
         "open_incidents": open_incidents,
         "active_suppress_rules": suppress_rules,
         "by_severity": {r[0]: r[1] for r in by_severity},

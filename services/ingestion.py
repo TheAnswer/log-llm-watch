@@ -113,6 +113,17 @@ def ingest_event(payload: Any, event: dict[str, str]) -> dict[str, Any]:
     if should_ignore(event["message"]):
         with _EVENT_COUNTS_LOCK:
             _EVENT_COUNTS["total_ignored"] += 1
+        today = utcnow().strftime("%Y-%m-%d")
+        try:
+            with sqlite3.connect(config.DB_PATH) as conn:
+                conn.execute("PRAGMA busy_timeout=5000;")
+                conn.execute(
+                    "INSERT INTO ignored_daily (day, count) VALUES (?, 1) ON CONFLICT(day) DO UPDATE SET count = count + 1",
+                    (today,),
+                )
+                conn.commit()
+        except Exception:
+            pass
         log_ignored(event["container"], event["host"], event["message"],
                     "regex/suppress", (time.monotonic() - t0) * 1000)
         return {"stored": False, "reason": "ignored"}

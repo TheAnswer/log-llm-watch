@@ -186,6 +186,15 @@ def init_db() -> None:
 
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS ignored_daily (
+                day TEXT PRIMARY KEY,
+                count INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS llm_noise_fingerprints (
                 fingerprint TEXT PRIMARY KEY,
                 suppressed_until TEXT NOT NULL,

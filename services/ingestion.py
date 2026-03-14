@@ -28,14 +28,15 @@ def store_event(payload: Any, event: dict[str, str]) -> str:
     enriched = enrich_event(event)
     with _INCIDENT_LOCK, db() as conn:
         incident_id = attach_or_create_incident(conn, enriched)
+        suppressed = 1 if incident_id is None else 0
         conn.execute(
             """
             INSERT INTO events (
                 created_at, processed, source, host, container, stream, level, message,
                 raw_json, fingerprint, ts, host_type, service, app_stack, event_class,
-                dependency, canonical_fingerprint, incident_id, severity_norm, message_template, labels
+                dependency, canonical_fingerprint, incident_id, severity_norm, message_template, labels, suppressed
             )
-            VALUES (?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 utcnow().isoformat(),
@@ -45,7 +46,7 @@ def store_event(payload: Any, event: dict[str, str]) -> str:
                 enriched["ts"], enriched["host_type"], enriched["service"],
                 enriched["app_stack"], enriched["event_class"], enriched["dependency"],
                 enriched["canonical_fingerprint"], incident_id, enriched["severity_norm"],
-                enriched["message_template"], enriched["labels"],
+                enriched["message_template"], enriched["labels"], suppressed,
             ),
         )
         conn.commit()

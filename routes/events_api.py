@@ -26,7 +26,7 @@ def api_events(
 
     sql = """
     SELECT id, ts, created_at, source, host, container, stream, level, severity_norm,
-           event_class, dependency, message, incident_id, processed, fingerprint
+           event_class, dependency, message, incident_id, processed, fingerprint, suppressed
     FROM events
     WHERE created_at >= ?
     """

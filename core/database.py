@@ -52,6 +52,7 @@ def init_db() -> None:
         add_column_if_missing("events", "severity_norm", "TEXT")
         add_column_if_missing("events", "message_template", "TEXT")
         add_column_if_missing("events", "labels", "TEXT DEFAULT '{}'")
+        add_column_if_missing("events", "suppressed", "INTEGER NOT NULL DEFAULT 0")
 
         conn.execute(
             """

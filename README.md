@@ -59,7 +59,7 @@ A FastAPI service that ingests infrastructure logs from multiple sources (Dozzle
 │   └── normalize.py            # Fingerprinting, severity mapping, event classification
 │
 ├── services/                   # Business logic with side effects
-│   ├── ollama.py               # Ollama HTTP client, token tracking, context overflow detection
+│   ├── ollama.py               # Ollama HTTP client (generate, chat), token tracking, context overflow detection
 │   ├── notifications.py        # ntfy push notifications with DB logging
 │   ├── suppression.py          # Rule caching, regex matching, LLM-assisted auto-suppress
 │   ├── incidents.py            # Incident lifecycle, LLM analysis, false-positive auto-close
@@ -75,6 +75,7 @@ A FastAPI service that ingests infrastructure logs from multiple sources (Dozzle
 │   ├── stats_api.py            # LLM stats, LLM call log, ntfy notification log
 │   ├── suppress_api.py         # Suppression rule list and delete
 │   ├── admin.py                # Config reload, backfill, manual report triggers, vacuum
+│   ├── chat_api.py             # Multi-turn LLM chat for incident investigation
 │   └── tools.py                # Simplified endpoints for external integrations (OpenWebUI)
 │
 └── tests/                      # pytest unit tests
@@ -261,6 +262,7 @@ The service calls a local Ollama instance for:
 - **Suppress regex generation** — Generate precise regex patterns for events classified as noise
 - **Daily/weekly reports** — Natural language health summaries with actionable recommendations
 - **Incident digest** — On-demand summary of all open incidents
+- **Incident chat** — Multi-turn conversational investigation scoped to a specific incident
 
 All LLM calls are tracked with:
 - Duration, prompt/completion token counts, model name
@@ -298,6 +300,7 @@ All LLM calls are tracked with:
 | `GET` | `/api/incidents/{id}/llm-context` | Context formatted for LLM analysis |
 | `POST` | `/api/incidents/{id}/analyze` | Trigger LLM root-cause analysis |
 | `POST` | `/api/incidents/{id}/suppress` | Create suppress rule and close incident |
+| `POST` | `/api/incidents/{id}/chat` | Multi-turn LLM chat for incident investigation |
 | `POST` | `/api/incidents/analyze-missing` | Batch-analyze incidents without summaries |
 | `GET` | `/api/incidents/open/llm-digest` | LLM-generated digest of open incidents (cached 5 min) |
 
@@ -313,6 +316,7 @@ All LLM calls are tracked with:
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/api/llm-stats` | LLM usage stats (params: `days`) |
+| `GET` | `/api/event-stats` | Event counts, severity/source breakdowns (params: `days`) |
 | `GET` | `/api/llm-log` | Recent LLM call log (params: `limit`) |
 | `GET` | `/api/ntfy-log` | Recent notification log (params: `limit`) |
 
@@ -379,6 +383,7 @@ SQLite with WAL mode. Schema is auto-created and auto-migrated on startup via `a
 | `daily_runs` | Deduplication for daily reports |
 | `weekly_runs` | Deduplication for weekly reports |
 | `housekeeping_runs` | Deduplication for cleanup jobs |
+| `ignored_daily` | Daily counts of pre-storage ignored events |
 | `llm_noise_fingerprints` | Temporary noise suppression |
 
 ## Frontend

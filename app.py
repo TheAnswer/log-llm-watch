@@ -19,6 +19,7 @@ from routes.admin import router as admin_router
 from routes.tools import router as tools_router
 from routes.suppress_api import router as suppress_router
 from routes.stats_api import router as stats_router
+from routes.chat_api import router as chat_router
 
 
 @asynccontextmanager
@@ -61,6 +62,7 @@ app.include_router(admin_router)
 app.include_router(tools_router)
 app.include_router(suppress_router)
 app.include_router(stats_router)
+app.include_router(chat_router)
 
 
 if __name__ == "__main__":

@@ -161,6 +161,46 @@ def call_ollama(prompt: str) -> tuple[dict[str, Any], str]:
         raise
 
 
+def call_ollama_chat(messages: list[dict[str, str]]) -> str:
+    """Multi-turn chat via Ollama /api/chat. Returns plain text response."""
+    url = config.CONFIG["ollama"]["url"].rstrip("/") + "/api/chat"
+    num_ctx = int(config.CONFIG["ollama"].get("num_ctx", 32768))
+    body = {
+        "model": config.CONFIG["ollama"]["model"],
+        "messages": messages,
+        "stream": False,
+        "options": {
+            "temperature": 0.3,
+            "num_ctx": num_ctx,
+        },
+    }
+
+    caller = _infer_caller()
+    t0 = time.monotonic()
+    token_stats: dict[str, Any] = {}
+    response_text = ""
+    try:
+        with _OLLAMA_LOCK:
+            r = requests.post(url, json=body, timeout=config.CONFIG["ollama"]["timeout_seconds"])
+        r.raise_for_status()
+        data = r.json()
+        token_stats = _extract_token_stats(data)
+
+        _check_context_limit(data, num_ctx)
+
+        msg = data.get("message") or {}
+        text = (msg.get("content") or "").strip()
+        response_text = text
+        if not text:
+            raise ValueError(f"Ollama chat returned empty response. Full payload: {data!r}")
+
+        _record_llm_call(time.monotonic() - t0, caller=caller, response_preview=response_text, **token_stats)
+        return text
+    except Exception:
+        _record_llm_call(time.monotonic() - t0, error=True, caller=caller, response_preview=response_text, **token_stats)
+        raise
+
+
 def call_ollama_text(prompt: str) -> str:
     url = config.CONFIG["ollama"]["url"].rstrip("/") + "/api/generate"
     num_ctx = int(config.CONFIG["ollama"].get("num_ctx", 32768))

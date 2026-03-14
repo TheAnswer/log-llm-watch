@@ -13,7 +13,7 @@ ollama:
   num_ctx: 131072
 
 analysis:
-  batch_window_minutes: 5
+  batch_window_minutes: 4
   max_examples_per_group: 5
   min_events_before_analysis: 1
   ignore_if_older_than_hours: 24

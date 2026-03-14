@@ -16,6 +16,13 @@ from services.suppression import log_ignored, should_ignore
 _THREAD_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="db")
 _INCIDENT_LOCK = threading.Lock()
 
+_EVENT_COUNTS: dict[str, int] = {
+    "total_received": 0,
+    "total_stored": 0,
+    "total_ignored": 0,
+}
+_EVENT_COUNTS_LOCK = threading.Lock()
+
 
 def store_event(payload: Any, event: dict[str, str]) -> str:
     enriched = enrich_event(event)
@@ -98,11 +105,18 @@ def backfill_existing_events(limit: int = 500) -> int:
 
 def ingest_event(payload: Any, event: dict[str, str]) -> dict[str, Any]:
     """Run all blocking work (ignore check, DB write) off the async event loop."""
+    with _EVENT_COUNTS_LOCK:
+        _EVENT_COUNTS["total_received"] += 1
+
     t0 = time.monotonic()
     if should_ignore(event["message"]):
+        with _EVENT_COUNTS_LOCK:
+            _EVENT_COUNTS["total_ignored"] += 1
         log_ignored(event["container"], event["host"], event["message"],
                     "regex/suppress", (time.monotonic() - t0) * 1000)
         return {"stored": False, "reason": "ignored"}
 
     fp = store_event(payload, event)
+    with _EVENT_COUNTS_LOCK:
+        _EVENT_COUNTS["total_stored"] += 1
     return {"stored": True, "source": event["source"], "container": event["container"], "fingerprint": fp}

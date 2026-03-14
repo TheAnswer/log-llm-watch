@@ -6,6 +6,7 @@ from fastapi import APIRouter
 
 from core import config
 from core.config import utcnow
+from services.ingestion import _EVENT_COUNTS
 from services.ollama import _LLM_STATS
 
 router = APIRouter()
@@ -63,6 +64,65 @@ def api_llm_stats(days: int = 7):
         "daily": [dict(d) for d in daily],
         "recent": [dict(r) for r in recent],
         "session": dict(_LLM_STATS),
+    }
+
+
+@router.get("/api/event-stats")
+def api_event_stats(days: int = 7):
+    days = max(1, min(days, 90))
+    cutoff = (utcnow() - timedelta(days=days)).isoformat()
+    with sqlite3.connect(config.DB_PATH) as conn:
+        total_stored = conn.execute(
+            "SELECT COUNT(*) FROM events WHERE created_at >= ?", (cutoff,)
+        ).fetchone()[0]
+        by_severity = conn.execute(
+            """
+            SELECT COALESCE(severity_norm, 'unknown') AS sev, COUNT(*) AS cnt
+            FROM events WHERE created_at >= ?
+            GROUP BY sev ORDER BY cnt DESC
+            """,
+            (cutoff,),
+        ).fetchall()
+        by_source = conn.execute(
+            """
+            SELECT COALESCE(source, 'unknown') AS src, COUNT(*) AS cnt
+            FROM events WHERE created_at >= ?
+            GROUP BY src ORDER BY cnt DESC
+            """,
+            (cutoff,),
+        ).fetchall()
+        by_event_class = conn.execute(
+            """
+            SELECT COALESCE(event_class, 'unknown') AS ec, COUNT(*) AS cnt
+            FROM events WHERE created_at >= ?
+            GROUP BY ec ORDER BY cnt DESC LIMIT 20
+            """,
+            (cutoff,),
+        ).fetchall()
+        daily = conn.execute(
+            """
+            SELECT DATE(created_at) AS day, COUNT(*) AS cnt
+            FROM events WHERE created_at >= ?
+            GROUP BY DATE(created_at) ORDER BY day
+            """,
+            (cutoff,),
+        ).fetchall()
+        open_incidents = conn.execute(
+            "SELECT COUNT(*) FROM incidents WHERE status = 'open'"
+        ).fetchone()[0]
+        suppress_rules = conn.execute(
+            "SELECT COUNT(*) FROM suppress_rules"
+        ).fetchone()[0]
+    return {
+        "period_days": days,
+        "total_stored": total_stored,
+        "open_incidents": open_incidents,
+        "active_suppress_rules": suppress_rules,
+        "by_severity": {r[0]: r[1] for r in by_severity},
+        "by_source": {r[0]: r[1] for r in by_source},
+        "by_event_class": {r[0]: r[1] for r in by_event_class},
+        "daily": [{"day": r[0], "count": r[1]} for r in daily],
+        "session": dict(_EVENT_COUNTS),
     }
 
 

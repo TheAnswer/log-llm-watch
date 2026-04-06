@@ -158,3 +158,27 @@ def api_ntfy_log(limit: int = 50):
             (limit,),
         ).fetchall()
     return {"items": [dict(row) for row in rows]}
+
+
+@router.get("/api/reports/daily")
+def api_daily_reports(limit: int = 50):
+    limit = max(1, min(limit, 200))
+    with sqlite3.connect(config.DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT id, sent_at, title, priority, source, message FROM ntfy_log WHERE source = 'daily_report' ORDER BY id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return {"items": [dict(row) for row in rows]}
+
+
+@router.get("/api/reports/weekly")
+def api_weekly_reports(limit: int = 50):
+    limit = max(1, min(limit, 200))
+    with sqlite3.connect(config.DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT id, sent_at, title, priority, source, message FROM ntfy_log WHERE source = 'weekly_report' ORDER BY id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return {"items": [dict(row) for row in rows]}

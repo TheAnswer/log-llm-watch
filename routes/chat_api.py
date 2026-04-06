@@ -53,7 +53,7 @@ Respond concisely in markdown. If you are unsure, say so.
         full_messages.append({"role": role, "content": msg.get("content", "")})
 
     try:
-        response = call_ollama_chat(full_messages)
+        response = call_ollama_chat(full_messages, think=True)
     except Exception as e:
         return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
 

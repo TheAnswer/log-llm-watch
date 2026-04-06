@@ -94,6 +94,7 @@ def call_ollama(prompt: str) -> tuple[dict[str, Any], str]:
         "prompt": prompt,
         "stream": False,
         "format": "json",
+        "think": False,
         "options": {
             "temperature": 0.1,
             "num_ctx": num_ctx,
@@ -161,7 +162,7 @@ def call_ollama(prompt: str) -> tuple[dict[str, Any], str]:
         raise
 
 
-def call_ollama_chat(messages: list[dict[str, str]]) -> str:
+def call_ollama_chat(messages: list[dict[str, str]], *, think: bool = False) -> str:
     """Multi-turn chat via Ollama /api/chat. Returns plain text response."""
     url = config.CONFIG["ollama"]["url"].rstrip("/") + "/api/chat"
     num_ctx = int(config.CONFIG["ollama"].get("num_ctx", 32768))
@@ -169,6 +170,7 @@ def call_ollama_chat(messages: list[dict[str, str]]) -> str:
         "model": config.CONFIG["ollama"]["model"],
         "messages": messages,
         "stream": False,
+        "think": think,
         "options": {
             "temperature": 0.3,
             "num_ctx": num_ctx,
@@ -208,6 +210,7 @@ def call_ollama_text(prompt: str) -> str:
         "model": config.CONFIG["ollama"]["model"],
         "prompt": prompt,
         "stream": False,
+        "think": False,
         "options": {
             "temperature": 0.2,
             "num_ctx": num_ctx,

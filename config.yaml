@@ -9,11 +9,11 @@ ollama:
   url: http://localhost:11434
   model: qwen3.5:9b
     #model: qwen3.5:35b-a3b
-  timeout_seconds: 300
+  timeout_seconds: 3600
   num_ctx: 131072
 
 analysis:
-  batch_window_minutes: 4
+  batch_window_minutes: 10
   max_examples_per_group: 5
   min_events_before_analysis: 1
   ignore_if_older_than_hours: 24
@@ -54,6 +54,16 @@ node_metadata:
     subnet: 192.168.2.0/24
 
   proxmox-venus:
+    host_type: proxmox
+    role: hypervisor
+    subnet: 192.168.2.0/24
+
+  proxmox-venus-media:
+    host_type: proxmox
+    role: hypervisor
+    subnet: 192.168.2.0/24
+
+  proxmox-intel:
     host_type: proxmox
     role: hypervisor
     subnet: 192.168.2.0/24
